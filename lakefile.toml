@@ -1,0 +1,10 @@
+name = "causallib"
+version = "0.1.0"
+defaultTargets = ["CausalLib"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+
+[[lean_lib]]
+name = "CausalLib"
