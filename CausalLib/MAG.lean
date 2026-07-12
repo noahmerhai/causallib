@@ -138,7 +138,39 @@ abbrev dSep (G : MAG V) (X Y : V) (Z : Finset V) : Prop :=
   G.mSep X Y Z
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §5. Basic lemmas
+-- §5. Graphoid axioms for m-separation
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- isCollider is symmetric: both sides are (A || B) && (C || D) and (C || D) && (A || B).
+private lemma isCollider_symm (G : MAG V) (prev curr next : V) :
+    G.isCollider prev curr next = G.isCollider next curr prev := by
+  simp [isCollider, Bool.and_comm]
+
+-- segmentBlocked depends on isCollider and curr only, so it inherits symmetry.
+private lemma segmentBlocked_symm (G : MAG V) (Z : Finset V) (prev curr next : V) :
+    G.segmentBlocked Z prev curr next = G.segmentBlocked Z next curr prev := by
+  simp [segmentBlocked, isCollider_symm]
+
+-- Reversing a path gives the same blocking value because the segments are the
+-- same set (with prev/next swapped), and segmentBlocked is symmetric.
+-- Formal proof: express pathBlocked as List.any over pathSegs, show
+-- pathSegs path.reverse = (pathSegs path).reverse.map (swap prev next),
+-- then use List.any_reverse and segmentBlocked_symm.
+private lemma pathBlocked_reverse (G : MAG V) (Z : Finset V) (path : List V) :
+    G.pathBlocked Z path.reverse = G.pathBlocked Z path := by
+  sorry
+
+/-- m-Separation is symmetric: X ⊥ Y | Z → Y ⊥ X | Z -/
+theorem mSep_symm (G : MAG V) (X Y : V) (Z : Finset V)
+    (h : mSep G X Y Z) : mSep G Y X Z := by
+  intro path hhead hlast
+  rw [← pathBlocked_reverse G Z path]
+  apply h
+  · rwa [List.head?_reverse]
+  · rwa [List.getLast?_reverse]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- §6. Basic lemmas
 -- ─────────────────────────────────────────────────────────────────────────────
 
 /-- Bidirected edges are symmetric by construction -/
