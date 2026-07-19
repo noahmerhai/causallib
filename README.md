@@ -4,14 +4,13 @@ Formalizing causal inference structures in Lean 4.
 
 ## Overview
 
-Four graph structures, building from general to specific:
+Three graph structures, building from general to specific:
 
 | File | Structure | Key property |
 |---|---|---|
 | `CausalLib/DirectedGraph.lean` | `DirectedGraph` | Asymmetric neighborhoods, cycles allowed |
 | `CausalLib/DAG.lean` | `DAG` | Directed acyclic graph; d-separation is a graphoid (fully proved) |
-| `CausalLib/ADMG.lean` | `ADMG` | Acyclic directed mixed graph (bow-free); m-separation is a graphoid (fully proved) |
-| `CausalLib/MAG.lean` | `MAG` | Mixed acyclic graph; m-separation (in progress) |
+| `CausalLib/ADMG.lean` | `ADMG` | General acyclic directed mixed graph (bows allowed); separation graphoid axioms fully proved at the walk level |
 
 ## Structure
 
@@ -22,8 +21,7 @@ causallib/
 ├── CausalLib/
 │   ├── DirectedGraph.lean   -- General directed graph
 │   ├── DAG.lean             -- DAG + d-separation + graphoid axioms
-│   ├── ADMG.lean            -- ADMG + m-separation + graphoid axioms + DAG embedding
-│   └── MAG.lean             -- MAG + m-separation (has one remaining sorry)
+│   └── ADMG.lean            -- ADMG + d-separation + graphoid axioms + DAG embedding
 ├── weak_union_dsep.tex      -- Paper proof of Weak Union via the Active Path Lemma
 └── README.md
 ```
@@ -60,34 +58,53 @@ lake update && lake build
   (Symmetry, Decomposition, Weak Union, Contraction) plus `dSepSet_intersection`
 
 ### ADMG
-- Directed + bidirected edges; directed part acyclic; **bow-free**
-  (no pair carries both a directed and a bidirected edge — required for
-  walk-based m-separation to be sound; with a bow, Weak Union fails)
-- `parents`, `children`, `spouses`, `ancestors`, `descendants`
-- Mixed-graph `isCollider` (arrowheads on both sides), `segmentBlocked` with the
-  standard collider-opening rule (collider ∈ An(Z), via descendants)
-- `mSep` / `mSepSet` — m-separation as a `Prop`, quantified over walks
-- **Graphoid axioms, all proved with no sorries**: `mSep_semigraphoid`
-  plus `mSepSet_intersection`
-- `DAG.toADMG` — embeds any DAG as an ADMG with no bidirected edges
-- `DAG.toADMG_mSep_iff` — m-separation on the embedding is exactly d-separation
-  (the ADMG development conservatively extends DAG.lean)
+A **general** ADMG: directed and bidirected edges, directed part acyclic, with
+**no bow-freeness assumption** — a pair of vertices may carry both a directed
+and a bidirected edge (a "bow").
 
-### MAG
-- `parents`, `children`, `spouses` (bidirected neighbors)
-- `ancestors`, `descendants` (directed edges only)
-- Extended `isCollider` covering directed + bidirected edge combinations
-- `mSep` / `dSep` — m-separation as a `Prop`
-- `mSep_symm` (modulo one `sorry` in `pathBlocked_reverse`)
+- `Mark` (`dirFwd` / `dirBack` / `bidir`) — every walk step records which
+  *specific* edge it traverses. This is what makes collider detection
+  unambiguous even across a bow, without needing to forbid bows outright:
+  a bare vertex-adjacency check can't tell two parallel edges apart, but a
+  walk that names its marks can. `Mark.valid` checks a mark against the
+  graph; `isCollider m1 m2` and `segmentBlocked` are defined purely from
+  marks.
+- `IsWalk` / `IsPath` — a walk is a `(vertices, marks)` pair in lock-step;
+  a path additionally requires `vertices.Nodup` (no repeated vertex — the
+  literal, textbook meaning of "path").
+- `dSep` / `dSepSet` — **d-separation quantified over genuine simple paths**,
+  matching the textbook definition exactly. **Symmetry and Decomposition are
+  proved directly for this relation**, with no sorry.
+- `dSepWalk` / `dSepSetWalk` — an auxiliary, **walk**-quantified relation
+  (repeats allowed; the same style DAG.lean itself uses). **Weak Union,
+  Contraction and Intersection are proved for this relation**, via
+  `chainBuild`, `active_path_lemma`, `contraction_walk`, `intersection_walk`
+  — all with no sorry, and none of it needs bow-freeness (see `Mark` above).
+  `dSep_of_dSepWalk` transfers walk-level separation down to path-level
+  separation for free.
+  **Why the deep axioms stop at `dSepWalk`, not `dSep`:** upgrading them to
+  the simple-path relation needs a genuine "every active walk contains an
+  active simple path" shortcutting theorem. It's true and provable in
+  principle, but the gluing construction inside the Active Path Lemma can
+  revisit an earlier path vertex when a bidirected edge lets a directed
+  chain double back to it, and repairing that needs a forbidden-set-avoiding
+  reachability search — real additional work, not included here. This gap
+  is documented in code on `dSepWalk`.
+- `DAG.toADMG` — embeds any DAG as a bidirected-edge-free ADMG
+- `DAG.toADMG_dSepWalk_iff` — `dSepWalk` on the embedding is exactly
+  DAG.lean's own (walk-quantified) `dSep`
 
 ## Roadmap
 
 - [x] Prove `dSep_symm`
 - [x] Prove the graphoid axioms for d-separation (DAG)
-- [x] Prove the graphoid axioms for m-separation (bow-free ADMG)
-- [x] Embed DAGs into ADMGs and prove the separation relations agree
-- [ ] Repair MAG.lean: walk-quantified `mSep`, descendant-based collider opening,
-      remove the `pathBlocked_reverse` sorry (all available to port from ADMG.lean)
-- [ ] Add ancestrality/maximality to MAG and relate it to ADMG
+- [x] Generalize ADMG to allow bows (no bow-freeness assumption), via
+      mark-annotated walks
+- [x] Define ADMG separation over genuine simple paths; prove Symmetry and
+      Decomposition directly for it
+- [x] Prove Weak Union, Contraction, Intersection for the walk-quantified
+      `dSepWalk`; embed DAGs and prove the walk-level relations agree
+- [ ] Prove the walk-to-simple-path shortcutting theorem needed to lift
+      Weak Union / Contraction / Intersection from `dSepWalk` to `dSep`
 - [ ] Connect to `Mathlib.Combinatorics.SimpleGraph`
 - [ ] Define probability measures and prove the backdoor adjustment theorem

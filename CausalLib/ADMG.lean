@@ -1,10 +1,18 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ADMG.lean
 -- Acyclic Directed Mixed Graph (ADMG) — directed AND bidirected edges,
--- directed part acyclic, bow-free.  m-Separation (the mixed-graph analogue of
--- d-separation) is defined here, and the full graphoid development of DAG.lean
--- is carried over with complete proofs (no sorries): Symmetry, Decomposition,
--- Weak Union, Contraction, and Intersection.
+-- directed part acyclic.  GENERAL ADMGs are allowed: a pair of vertices may
+-- carry BOTH a directed and a bidirected edge (a "bow").  Walks record the
+-- SPECIFIC edge used at each step (a `Mark`), so collider detection stays
+-- unambiguous even across a bow — no bow-freeness assumption is needed.
+--
+-- `dSep` is the literal textbook definition: quantified over genuine SIMPLE
+-- PATHS (no repeated vertex).  Symmetry and Decomposition are proved
+-- directly for it.  Weak Union, Contraction and Intersection are proved for
+-- the auxiliary, walk-quantified relation `dSepWalk` (repeats allowed, the
+-- same style DAG.lean itself uses for its `dSep`) — see the doc comment on
+-- `dSepWalk` for exactly why, and `dSep_of_dSepWalk` for the direction that
+-- transfers for free.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 import Mathlib.Data.Finset.Basic
@@ -22,21 +30,9 @@ variable {V : Type*} [Fintype V] [DecidableEq V]
 -- §1. ADMG structure
 -- ─────────────────────────────────────────────────────────────────────────────
 
-/-- An Acyclic Directed Mixed Graph (ADMG) over vertex type V.
-    Contains two kinds of edges:
-      Directed edges (→):   `directed u v = true` means u → v
-      Bidirected edges (↔): `bidirected u v = true` means u ↔ v (symmetric)
-
-    Acyclicity is enforced over directed edges only — the directed part must
-    be a DAG.  Bidirected edges represent hidden common causes.
-
-    We additionally require the graph to be BOW-FREE: no pair of nodes carries
-    both a directed and a bidirected edge.  Walks are represented below as
-    vertex lists, which cannot distinguish parallel edges; a bow would let the
-    bidirected edge masquerade as the directed one at a collider check, and
-    m-separation over vertex walks would then fail Weak Union.  Bow-freeness
-    makes the vertex-walk semantics faithful, and is exactly the hypothesis
-    under which the graphoid axioms below are proved. -/
+/-- An Acyclic Directed Mixed Graph (ADMG) over vertex type V.  A GENERAL
+    ADMG: a pair of vertices may carry both a directed edge and a bidirected
+    edge (a "bow").  Acyclicity is enforced over directed edges only. -/
 structure ADMG (V : Type*) [Fintype V] [DecidableEq V] where
   /-- Directed edges -/
   directed    : V → V → Bool
@@ -48,8 +44,6 @@ structure ADMG (V : Type*) [Fintype V] [DecidableEq V] where
   bid_no_loop : ∀ v : V, bidirected v v = false
   /-- Bidirected edges are symmetric -/
   bid_symm    : ∀ u v : V, bidirected u v = bidirected v u
-  /-- Bow-free: no pair has BOTH a directed and a bidirected edge -/
-  no_bow      : ∀ u v : V, directed u v = true → bidirected u v = false
   /-- The directed part is acyclic -/
   dir_acyclic : ∀ v : V,
     (DirectedGraph.mk directed dir_no_loop).canReach v v = false
@@ -114,8 +108,6 @@ def isDescendant (G : ADMG V) (u v : V) : Bool :=
   u ∈ G.descendants v
 
 -- ── Reachability helper lemmas on an arbitrary directed graph ───────────────
--- (Restated privately here so they apply to `directedPart`; DAG.lean carries
---  its own copies phrased for the DAG structure.)
 
 private lemma mem_outNeighbors (H : DirectedGraph V) (v u : V) :
     u ∈ H.outNeighbors v ↔ H.adj v u = true := by
@@ -178,189 +170,463 @@ lemma dir_no_2cycle (G : ADMG V) {a b : V} (hab : G.directed a b = true) :
   rw [directedPart_acyclic G a] at hcan
   exact absurd hcan (by simp)
 
-/-- Acyclicity + bow-freeness: a directed edge c → n means NO arrowhead
-    points from n back into c — neither n → c (acyclicity) nor n ↔ c (no bow).
-    This is what makes a directed chain node a genuine non-collider. -/
-lemma no_arrowhead_back (G : ADMG V) {c n : V} (h : G.directed c n = true) :
-    (G.directed n c || G.bidirected n c) = false := by
-  rw [dir_no_2cycle G h, Bool.false_or, G.bid_symm n c]
-  exact G.no_bow c n h
+end ADMG
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §3b. Walks
+-- §3b. Marks — the specific edge used at one step of a walk
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- As in DAG.lean, a "path" for m-separation is an UNDIRECTED walk: consecutive
--- nodes must be adjacent (connected by SOME edge).  Quantifying over walks —
--- rather than arbitrary node lists — is what makes m-separation the standard,
--- non-degenerate notion.
+/-- Which physical edge is traversed at one step of a walk from `a` to `b`,
+    and its orientation relative to the direction of travel.  Recording this
+    explicitly — instead of deriving colliders from bare vertex adjacency —
+    is what lets a walk pass correctly through a BOW: a pair carrying both a
+    directed and a bidirected edge no longer has an ambiguous collider
+    status, because the walk records which edge it actually took. -/
+inductive Mark
+  | dirFwd
+  | dirBack
+  | bidir
+  deriving DecidableEq
 
-/-- Two nodes are adjacent if some edge joins them: a directed edge in either
-    direction, or a bidirected edge. -/
-def Adj (G : ADMG V) (a b : V) : Prop :=
-  G.directed a b = true ∨ G.directed b a = true ∨ G.bidirected a b = true
+namespace Mark
 
-lemma Adj_symm (G : ADMG V) {a b : V} (h : G.Adj a b) : G.Adj b a := by
-  rcases h with h | h | h
-  · exact Or.inr (Or.inl h)
-  · exact Or.inl h
-  · exact Or.inr (Or.inr (by rw [G.bid_symm b a]; exact h))
+/-- Reversing the direction of travel swaps a directed edge's role; a
+    bidirected edge reads the same either way. -/
+def flip : Mark → Mark
+  | dirFwd  => dirBack
+  | dirBack => dirFwd
+  | bidir   => bidir
 
-/-- A directed edge gives adjacency. -/
-lemma adj_of_directed (G : ADMG V) {a b : V} (h : G.directed a b = true) : G.Adj a b :=
-  Or.inl h
+@[simp] lemma flip_flip (m : Mark) : m.flip.flip = m := by cases m <;> rfl
 
-/-- A bidirected edge gives adjacency. -/
-lemma adj_of_bidirected (G : ADMG V) {a b : V} (h : G.bidirected a b = true) : G.Adj a b :=
-  Or.inr (Or.inr h)
+/-- Does this edge have an arrowhead pointing INTO the right-hand (second)
+    vertex of the step? -/
+def intoRight : Mark → Bool
+  | dirFwd  => true
+  | dirBack => false
+  | bidir   => true
 
-/-- Adjacency coincides with the Boolean edge query. -/
-lemma adj_iff_hasEdge (G : ADMG V) (a b : V) : G.Adj a b ↔ G.hasEdge a b = true := by
-  simp [Adj, hasEdge, or_assoc]
+/-- Does this edge have an arrowhead pointing INTO the left-hand (first)
+    vertex of the step? -/
+def intoLeft : Mark → Bool
+  | dirFwd  => false
+  | dirBack => true
+  | bidir   => true
 
-/-- A walk: every pair of consecutive nodes is adjacent. -/
-def IsWalk (G : ADMG V) (l : List V) : Prop := l.IsChain G.Adj
+@[simp] lemma intoLeft_flip (m : Mark) : m.flip.intoLeft = m.intoRight := by cases m <;> rfl
+@[simp] lemma intoRight_flip (m : Mark) : m.flip.intoRight = m.intoLeft := by cases m <;> rfl
 
-@[simp] lemma isWalk_nil (G : ADMG V) : G.IsWalk ([] : List V) := List.isChain_nil
-@[simp] lemma isWalk_singleton (G : ADMG V) (a : V) : G.IsWalk [a] := List.isChain_singleton a
+/-- Is `m` a valid choice of edge from `x` to `y` in `G`? -/
+def valid (G : ADMG V) (x y : V) : Mark → Bool
+  | dirFwd  => G.directed x y
+  | dirBack => G.directed y x
+  | bidir   => G.bidirected x y
 
-lemma isWalk_cons₂ (G : ADMG V) (a b : V) (l : List V) :
-    G.IsWalk (a :: b :: l) ↔ G.Adj a b ∧ G.IsWalk (b :: l) := List.isChain_cons_cons
+lemma valid_flip (G : ADMG V) (a b : V) (m : Mark) :
+    valid G a b m = valid G b a m.flip := by
+  cases m <;> simp [valid, flip, G.bid_symm a b]
 
-/-- Reversing a walk is still a walk (adjacency is symmetric). -/
-lemma isWalk_reverse (G : ADMG V) (l : List V) : G.IsWalk l.reverse ↔ G.IsWalk l := by
-  unfold IsWalk
-  rw [List.isChain_reverse]
-  exact ⟨fun h => h.imp fun _ _ h' => G.Adj_symm h',
-         fun h => h.imp fun _ _ h' => G.Adj_symm h'⟩
+end Mark
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §4. m-Separation
+-- §3c. Colliders and blocking (mark-based, no bow-freeness needed)
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- In a mixed graph, a node is a collider when BOTH edge marks at that node are
--- arrowheads.  This covers directed and bidirected edge combinations:
---   prev → curr ← next    prev ↔ curr ← next
---   prev → curr ↔ next    prev ↔ curr ↔ next
+/-- Is the interior vertex a COLLIDER, given the marks of its two incident
+    edges in walk order (`m1` from the previous vertex, `m2` to the next)?
+    Both sides must have an arrowhead pointing in. -/
+def isCollider (m1 m2 : Mark) : Bool := m1.intoRight && m2.intoLeft
 
-/-- Is curr a COLLIDER on the path segment (prev, curr, next)?
-    Both the prev-side and next-side must have arrowheads pointing into curr. -/
-def isCollider (G : ADMG V) (prev curr next : V) : Bool :=
-  (G.directed prev curr || G.bidirected prev curr) &&
-  (G.directed next curr || G.bidirected next curr)
+lemma isCollider_flip_swap (m1 m2 : Mark) :
+    isCollider m2.flip m1.flip = isCollider m1 m2 := by
+  cases m1 <;> cases m2 <;> rfl
 
-/-- Is the 3-node segment (prev, curr, next) BLOCKED by conditioning set Z?
+/-- Is the interior vertex `curr` BLOCKED by Z, given the marks of its two
+    incident edges?
     - Non-collider: blocked when curr ∈ Z
-    - Collider:     blocked when curr ∉ Z AND no (directed-edge) descendant
-                    of curr is in Z — i.e. curr is opened exactly when it is
-                    an ancestor of Z (curr ∈ An(Z)). -/
-def segmentBlocked (G : ADMG V) (Z : Finset V) (prev curr next : V) : Bool :=
-  if G.isCollider prev curr next then
+    - Collider:     blocked when curr ∉ Z and no descendant of curr is in Z -/
+def ADMG.segmentBlocked (G : ADMG V) (Z : Finset V) (curr : V) (m1 m2 : Mark) : Bool :=
+  if isCollider m1 m2 then
     !(curr ∈ Z || (G.descendants curr ∩ Z).Nonempty)
   else
     curr ∈ Z
 
+lemma ADMG.segmentBlocked_flip_swap (G : ADMG V) (Z : Finset V) (curr : V) (m1 m2 : Mark) :
+    G.segmentBlocked Z curr m2.flip m1.flip = G.segmentBlocked Z curr m1 m2 := by
+  simp [ADMG.segmentBlocked, isCollider_flip_swap]
+
+namespace ADMG
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- §4. Walks and simple paths
+-- ─────────────────────────────────────────────────────────────────────────────
+
+/-- `IsWalk G verts marks` holds when `verts` lists the walk's vertices and
+    `marks`, in lockstep, the specific edge used between each consecutive
+    pair (so necessarily `marks.length + 1 = verts.length`). -/
+def IsWalk (G : ADMG V) : List V → List Mark → Prop
+  | [], [] => True
+  | [_], [] => True
+  | a :: b :: vs, m :: ms => Mark.valid G a b m = true ∧ IsWalk G (b :: vs) ms
+  | _, _ => False
+
+/-- A genuine simple path: a walk with no repeated vertex. -/
+def IsPath (G : ADMG V) (verts : List V) (marks : List Mark) : Prop :=
+  G.IsWalk verts marks ∧ verts.Nodup
+
+@[simp] lemma isWalk_nil (G : ADMG V) : G.IsWalk ([] : List V) [] := trivial
+@[simp] lemma isWalk_singleton (G : ADMG V) (a : V) : G.IsWalk [a] [] := trivial
+
+/-- The length invariant an `IsWalk` always satisfies. -/
+lemma isWalk_length (G : ADMG V) :
+    ∀ (verts : List V) (marks : List Mark), G.IsWalk verts marks →
+      marks.length + 1 = verts.length ∨ (verts = [] ∧ marks = []) := by
+  intro verts
+  induction verts with
+  | nil => intro marks h; cases marks with
+      | nil => exact Or.inr ⟨rfl, rfl⟩
+      | cons m ms => exact absurd h (by simp [IsWalk])
+  | cons a vs ih =>
+    intro marks h
+    cases vs with
+    | nil =>
+      cases marks with
+      | nil => exact Or.inl rfl
+      | cons m ms => exact absurd h (by simp [IsWalk])
+    | cons b vs' =>
+      cases marks with
+      | nil => exact absurd h (by simp [IsWalk])
+      | cons m ms =>
+        obtain ⟨_, htail⟩ := h
+        rcases ih ms htail with heq | ⟨hveq, _⟩
+        · left; simp only [List.length_cons] at heq ⊢; omega
+        · exact absurd hveq (by simp)
+
+/-- Specialization for a nonempty vertex list (the common case). -/
+lemma isWalk_length' (G : ADMG V) {verts : List V} {marks : List Mark}
+    (h : G.IsWalk verts marks) (hne : verts ≠ []) :
+    marks.length + 1 = verts.length := by
+  rcases isWalk_length G verts marks h with heq | ⟨hveq, _⟩
+  · exact heq
+  · exact absurd hveq hne
+
+lemma isWalk_cons₂ (G : ADMG V) (a b : V) (m : Mark) (l : List V) (ms : List Mark) :
+    G.IsWalk (a :: b :: l) (m :: ms) ↔ Mark.valid G a b m = true ∧ G.IsWalk (b :: l) ms :=
+  Iff.rfl
+
+/-- Marks for the walk traversed backward: reverse the order and flip each
+    step's orientation. -/
+def reverseMarks (marks : List Mark) : List Mark := (marks.map Mark.flip).reverse
+
+@[simp] lemma reverseMarks_nil : reverseMarks ([] : List Mark) = [] := rfl
+
+/-- Extending a walk by one more validated step at the end. -/
+private lemma isWalk_append_one (G : ADMG V) :
+    ∀ (l : List V) (ms : List Mark) (c : V), G.IsWalk l ms → l.getLast? = some c →
+      ∀ (x : V) (m' : Mark), Mark.valid G c x m' = true →
+        G.IsWalk (l ++ [x]) (ms ++ [m']) := by
+  intro l
+  induction l with
+  | nil => intro ms c _ hc; simp at hc
+  | cons a l ih =>
+    cases l with
+    | nil =>
+      intro ms c hwalk hc x m' hvalid
+      cases ms with
+      | nil =>
+        simp only [List.getLast?_singleton, Option.some.injEq] at hc
+        subst hc
+        exact ⟨hvalid, trivial⟩
+      | cons _ _ => exact absurd hwalk (by simp [IsWalk])
+    | cons b l' =>
+      intro ms c hwalk hc x m' hvalid
+      cases ms with
+      | nil => exact absurd hwalk (by simp [IsWalk])
+      | cons m ms' =>
+        obtain ⟨hv, htail⟩ := hwalk
+        rw [List.getLast?_cons_cons] at hc
+        have ihres := ih ms' c htail hc x m' hvalid
+        exact ⟨hv, ihres⟩
+
+/-- Reversing a walk is still a walk (with marks reversed and flipped). -/
+lemma isWalk_reverse (G : ADMG V) :
+    ∀ (verts : List V) (marks : List Mark), G.IsWalk verts marks →
+      G.IsWalk verts.reverse (reverseMarks marks) := by
+  intro verts
+  induction verts with
+  | nil =>
+      intro marks h
+      cases marks with
+      | nil => simp [reverseMarks]
+      | cons m ms => exact absurd h (by simp [IsWalk])
+  | cons a vs ih =>
+    intro marks h
+    cases vs with
+    | nil =>
+      cases marks with
+      | nil => simp [reverseMarks]
+      | cons m ms => exact absurd h (by simp [IsWalk])
+    | cons b vs' =>
+      cases marks with
+      | nil => exact absurd h (by simp [IsWalk])
+      | cons m ms =>
+        obtain ⟨hv, htail⟩ := h
+        have ihtail := ih ms htail
+        have hc : (b :: vs').reverse.getLast? = some b := by
+          simp [List.getLast?_reverse]
+        have hval : Mark.valid G b a m.flip = true := by
+          rw [← Mark.valid_flip]; exact hv
+        have hstep := isWalk_append_one G (b :: vs').reverse (reverseMarks ms) b ihtail hc a m.flip hval
+        have heq1 : (a :: b :: vs').reverse = (b :: vs').reverse ++ [a] := by
+          simp [List.reverse_cons]
+        have heq2 : reverseMarks (m :: ms) = reverseMarks ms ++ [m.flip] := by
+          simp [reverseMarks, List.reverse_cons]
+        rw [heq1, heq2]
+        exact hstep
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- §5. Blocked paths
+-- ─────────────────────────────────────────────────────────────────────────────
+
 /-- A path is BLOCKED by Z when at least one interior 3-node segment is
     blocked.  Paths of length 0, 1, or 2 have no interior node. -/
-def pathBlocked (G : ADMG V) (Z : Finset V) : List V → Bool
-  | []                           => false
-  | [_]                          => false
-  | [_, _]                       => false
-  | prev :: curr :: next :: rest =>
-      G.segmentBlocked Z prev curr next ||
-      G.pathBlocked Z (curr :: next :: rest)
+def pathBlocked (G : ADMG V) (Z : Finset V) : List V → List Mark → Bool
+  | [], _ => false
+  | [_], _ => false
+  | [_, _], _ => false
+  | _ :: _ :: _ :: _, [] => false
+  | _ :: _ :: _ :: _, [_] => false
+  | _ :: b :: c :: restV, m1 :: m2 :: restM =>
+      G.segmentBlocked Z b m1 m2 || pathBlocked G Z (b :: c :: restV) (m2 :: restM)
 
-/-- X and Y are M-SEPARATED by Z in G (written X ⊥_m Y | Z) iff every
-    undirected WALK between X and Y is blocked by Z. -/
-def mSep (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
-  ∀ path : List V,
-    G.IsWalk path →
-    path.head?    = some X →
-    path.getLast? = some Y →
-    G.pathBlocked Z path = true
+/-- A forward directed edge out of `c` makes `c` a non-collider (chain),
+    REGARDLESS of what edge precedes it — using `dirFwd` for the OUTGOING
+    step forces `intoLeft = false` on that side, so `isCollider` is false no
+    matter the incoming mark.  This is where the mark-based design pays off:
+    no bow-freeness assumption is needed to rule out `c` masquerading as a
+    collider. -/
+lemma segmentBlocked_chain (G : ADMG V) (Z : Finset V) (c : V) (m1 : Mark) (hc : c ∉ Z) :
+    G.segmentBlocked Z c m1 Mark.dirFwd = false := by
+  have hcoll : isCollider m1 Mark.dirFwd = false := by simp [isCollider, Mark.intoLeft]
+  simp [ADMG.segmentBlocked, hcoll, hc]
 
-/-- X and Y are M-CONNECTED given Z —
-    there exists an active (unblocked) WALK between them. -/
-def mConnected (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
-  ∃ path : List V,
-    G.IsWalk path ∧
-    path.head?    = some X ∧
-    path.getLast? = some Y ∧
-    G.pathBlocked Z path = false
+-- One-step unfolding of `pathBlocked`, valid for an arbitrary NONEMPTY tail
+-- `l` (the raw definition only fires on a literal three/two-element prefix).
+private lemma pathBlocked_cons_cons_of_ne (G : ADMG V) (Z : Finset V) (a b : V) (m1 : Mark)
+    (l : List V) (ms : List Mark) (hl : l ≠ []) :
+    G.pathBlocked Z (a :: b :: l) (m1 :: ms)
+      = ((Option.map (fun m2 => G.segmentBlocked Z b m1 m2) ms.head?).getD false
+          || G.pathBlocked Z (b :: l) ms) := by
+  rcases l with _ | ⟨c, l'⟩
+  · exact absurd rfl hl
+  · cases ms with
+    | nil => cases l' <;> simp [pathBlocked]
+    | cons m2 ms' => simp [pathBlocked]
 
-/-- Alias: d-separation in an ADMG is m-separation. -/
-abbrev dSep (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
-  G.mSep X Y Z
+/-- Appending two more validated steps `b` (mark `m1`) then `x` (mark `m2`)
+    to the end of a walk `l` (with matching mark count) only adds one new
+    interior segment, at `b`. -/
+private lemma pathBlocked_snoc (G : ADMG V) (Z : Finset V) :
+    ∀ (l : List V) (ms : List Mark), ms.length + 1 = l.length →
+      ∀ (b x : V) (m1 m2 : Mark),
+        G.pathBlocked Z (l ++ [b, x]) (ms ++ [m1, m2])
+          = (G.pathBlocked Z (l ++ [b]) (ms ++ [m1]) || G.segmentBlocked Z b m1 m2) := by
+  intro l
+  induction l with
+  | nil => intro ms hlen; simp at hlen
+  | cons v l ih =>
+    cases l with
+    | nil =>
+      intro ms hlen b x m1 m2
+      have hms : ms = [] := by
+        have hz : ms.length = 0 := by simpa using hlen
+        exact List.length_eq_zero_iff.mp hz
+      subst hms
+      simp [pathBlocked]
+    | cons w l' =>
+      intro ms hlen b x m1 m2
+      cases ms with
+      | nil => simp at hlen
+      | cons m ms' =>
+        have hlen' : ms'.length + 1 = (w :: l').length := by
+          simp only [List.length_cons] at hlen ⊢; omega
+        have ihres := ih ms' hlen' b x m1 m2
+        simp only [List.cons_append] at ihres ⊢
+        have hne1 : l' ++ [b, x] ≠ ([] : List V) := by simp
+        have hne2 : l' ++ [b] ≠ ([] : List V) := by simp
+        rw [pathBlocked_cons_cons_of_ne G Z v w m (l' ++ [b, x]) (ms' ++ [m1, m2]) hne1,
+            pathBlocked_cons_cons_of_ne G Z v w m (l' ++ [b]) (ms' ++ [m1]) hne2]
+        have h2 : (ms' ++ [m1, m2]).head? = (ms' ++ [m1]).head? := by cases ms' <;> rfl
+        rw [h2, ihres, Bool.or_assoc]
+
+/-- Reversing a walk preserves blocking: the interior triples are the same
+    set (reversed order, marks swapped-and-flipped at each), and
+    `segmentBlocked` is invariant under that swap-and-flip. -/
+lemma pathBlocked_reverse (G : ADMG V) (Z : Finset V) :
+    ∀ (verts : List V) (marks : List Mark), G.IsWalk verts marks →
+      G.pathBlocked Z verts.reverse (reverseMarks marks) = G.pathBlocked Z verts marks := by
+  intro verts
+  induction verts with
+  | nil => intro marks _; cases marks <;> rfl
+  | cons a vs ih =>
+    intro marks hwalk
+    cases vs with
+    | nil => cases marks with
+        | nil => rfl
+        | cons m ms => exact absurd hwalk (by simp [IsWalk])
+    | cons b vs' =>
+      cases marks with
+      | nil => exact absurd hwalk (by simp [IsWalk])
+      | cons m ms =>
+        obtain ⟨hv, htail⟩ := hwalk
+        cases vs' with
+        | nil =>
+          cases ms with
+          | nil =>
+            -- verts = [a,b], no interior node either way.
+            rfl
+          | cons _ _ => exact absurd htail (by simp [IsWalk])
+        | cons c vs'' =>
+          cases ms with
+          | nil => exact absurd htail (by simp [IsWalk])
+          | cons m2 ms' =>
+            have ihres := ih (m2 :: ms') htail
+            obtain ⟨_, htail2⟩ := htail
+            -- Go directly from `(c::vs'').reverse` to appending BOTH `b` and
+            -- `a` at once, avoiding any append-associativity bookkeeping.
+            have heqV : (a :: b :: c :: vs'').reverse = (c :: vs'').reverse ++ [b, a] := by
+              simp [List.reverse_cons]
+            have heqM : reverseMarks (m :: m2 :: ms') = reverseMarks ms' ++ [m2.flip, m.flip] := by
+              simp [reverseMarks, List.reverse_cons]
+            have heqV2 : (c :: vs'').reverse ++ [b] = (b :: c :: vs'').reverse := by
+              simp [List.reverse_cons]
+            have heqM2 : reverseMarks ms' ++ [m2.flip] = reverseMarks (m2 :: ms') := by
+              simp [reverseMarks, List.reverse_cons]
+            have hlenP : (reverseMarks ms').length + 1 = (c :: vs'').reverse.length := by
+              have hthis := isWalk_length' G htail2 (List.cons_ne_nil c vs'')
+              simp only [reverseMarks, List.length_reverse, List.length_map,
+                List.length_cons] at hthis ⊢
+              omega
+            rw [heqV, heqM,
+                pathBlocked_snoc G Z (c :: vs'').reverse (reverseMarks ms') hlenP b a m2.flip m.flip,
+                heqV2, heqM2, ihres, G.segmentBlocked_flip_swap Z b m m2, Bool.or_comm]
+            rfl
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §4b. Chain-segment lemmas (for the active-path argument)
+-- §6. d-Separation
 -- ─────────────────────────────────────────────────────────────────────────────
 
-/-- A forward directed edge out of `c` makes `c` a non-collider (chain) on the
-    segment — acyclicity kills a reverse directed edge and bow-freeness kills a
-    parallel bidirected edge — so the segment is unblocked exactly when `c ∉ Z`. -/
-lemma segmentBlocked_chain (G : ADMG V) (Z : Finset V) (p c n : V)
-    (h : G.directed c n = true) (hc : c ∉ Z) :
-    G.segmentBlocked Z p c n = false := by
-  have hcoll : G.isCollider p c n = false := by
-    unfold isCollider
-    rw [no_arrowhead_back G h, Bool.and_false]
-  unfold segmentBlocked
-  split
-  · rename_i hh; rw [hcoll] at hh; simp at hh
-  · exact decide_eq_false hc
+/-- **d-Separation** (X ⊥ Y | Z): every genuine SIMPLE PATH (no repeated
+    vertex) between X and Y is blocked by Z.  The literal textbook
+    definition of separation (m-separation, or d-separation) on a mixed
+    graph. -/
+def dSep (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
+  ∀ (verts : List V) (marks : List Mark),
+    G.IsWalk verts marks → verts.Nodup →
+    verts.head?    = some X →
+    verts.getLast? = some Y →
+    G.pathBlocked Z verts marks = true
 
-/-- **chainBuild.** Given a descendant `w` of `q` (reachable within `n` directed
-    steps) all of whose reachable nodes avoid `Z`, with `q ∉ Z` and `p`
-    adjacent to `q`, the directed chain `p, q, …, w` is an unblocked walk
-    ending at `w`.
+/-- **Auxiliary, walk-quantified separation** (repeated vertices allowed).
+    `dSepWalk` is STRICTLY STRONGER than `dSep` as a hypothesis — blocking
+    every walk is harder than blocking only the simple paths, which are a
+    subset of the walks — and correspondingly stronger as a conclusion.
+    DAG.lean's own `dSep` is exactly this walk-quantified notion.
 
-    This realises the directed path `σ : V_k → … → w` of Case (b) of the
-    Active Path Lemma, already glued to its predecessor `p = V_{k-1}`. -/
-lemma chainBuild (G : ADMG V) (Z : Finset V) :
-    ∀ (n : ℕ) (q w p : V),
-      w ∈ G.directedPart.reachableN n q →
-      (∀ u ∈ G.directedPart.reachableN n q, u ∉ Z) →
-      G.Adj p q →
-      q ∉ Z →
-      ∃ rt : List V, G.IsWalk (p :: q :: rt) ∧
-        (p :: q :: rt).getLast? = some w ∧
-        G.pathBlocked Z (p :: q :: rt) = false := by
-  intro n
-  induction n with
-  | zero => intro q w p hw _ _ _; simp [DirectedGraph.reachableN] at hw
-  | succ m ih =>
-      intro q w p hw hZ hpq hq
-      rw [mem_reachableN_succ] at hw
-      rcases hw with hwq | ⟨u, hu, hwu⟩
-      · -- edge q → w directly; chain p, q, w
-        have hqw : G.directed q w = true := (mem_outNeighbors G.directedPart q w).mp hwq
-        refine ⟨[w], ?_, ?_, ?_⟩
-        · rw [isWalk_cons₂]
-          exact ⟨hpq, by
-            rw [isWalk_cons₂]; exact ⟨adj_of_directed G hqw, isWalk_singleton G w⟩⟩
-        · rfl
-        · show (G.segmentBlocked Z p q w || G.pathBlocked Z [q, w]) = false
-          rw [Bool.or_eq_false_iff]
-          exact ⟨segmentBlocked_chain G Z p q w hqw hq, rfl⟩
-      · -- edge q → u, then recurse from u to w
-        have hqu : G.directed q u = true := (mem_outNeighbors G.directedPart q u).mp hu
-        have huZ : u ∉ Z := hZ u (by rw [mem_reachableN_succ]; exact Or.inl hu)
-        have hsub : G.directedPart.reachableN m u ⊆ G.directedPart.reachableN (m + 1) q := by
-          intro x hx; rw [mem_reachableN_succ]; exact Or.inr ⟨u, hu, hx⟩
-        obtain ⟨rt, hwalk, hlast, hblk⟩ :=
-          ih u w q hwu (fun x hx => hZ x (hsub hx)) (adj_of_directed G hqu) huZ
-        refine ⟨u :: rt, ?_, ?_, ?_⟩
-        · rw [isWalk_cons₂]; exact ⟨hpq, hwalk⟩
-        · rw [List.getLast?_cons_cons]; exact hlast
-        · show (G.segmentBlocked Z p q u || G.pathBlocked Z (q :: u :: rt)) = false
-          rw [Bool.or_eq_false_iff]
-          exact ⟨segmentBlocked_chain G Z p q u hqu hq, hblk⟩
+    Weak Union, Contraction and Intersection below are proved for
+    `dSepWalk`, not `dSep` directly.  The missing step to transfer them to
+    `dSep` is a genuine "every active walk contains an active simple path"
+    shortcutting theorem: real and provable in principle (e.g. via a
+    minimal-active-witness argument), but NOT included here — the gluing
+    construction inside the Active Path Lemma can revisit an earlier vertex
+    of the path when a bidirected edge lets a directed chain double back,
+    and repairing that needs a forbidden-set-avoiding search argument beyond
+    the scope of this file.  `dSep_of_dSepWalk` is the direction that DOES
+    transfer for free. -/
+def dSepWalk (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
+  ∀ (verts : List V) (marks : List Mark),
+    G.IsWalk verts marks →
+    verts.head?    = some X →
+    verts.getLast? = some Y →
+    G.pathBlocked Z verts marks = true
 
--- ── Reflexive-descendant analysis of segments ───────────────────────────────
+/-- Blocking every walk certainly blocks every simple path (a path is a
+    special case of a walk). -/
+lemma dSep_of_dSepWalk (G : ADMG V) (X Y : V) (Z : Finset V)
+    (h : G.dSepWalk X Y Z) : G.dSep X Y Z :=
+  fun verts marks hwalk _ hhead hlast => h verts marks hwalk hhead hlast
+
+/-- d-Separation is symmetric: X ⊥ Y | Z → Y ⊥ X | Z -/
+theorem dSep_symm (G : ADMG V) (X Y : V) (Z : Finset V) (h : G.dSep X Y Z) :
+    G.dSep Y X Z := by
+  intro verts marks hwalk hnodup hhead hlast
+  rw [← pathBlocked_reverse G Z verts marks hwalk]
+  apply h
+  · exact isWalk_reverse G verts marks hwalk
+  · exact List.nodup_reverse.mpr hnodup
+  · rwa [List.head?_reverse]
+  · rwa [List.getLast?_reverse]
+
+/-- d-Separation (walk-quantified) is symmetric. -/
+theorem dSepWalk_symm (G : ADMG V) (X Y : V) (Z : Finset V) (h : G.dSepWalk X Y Z) :
+    G.dSepWalk Y X Z := by
+  intro verts marks hwalk hhead hlast
+  rw [← pathBlocked_reverse G Z verts marks hwalk]
+  apply h
+  · exact isWalk_reverse G verts marks hwalk
+  · rwa [List.head?_reverse]
+  · rwa [List.getLast?_reverse]
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- §7. Set-level separation and Symmetry / Decomposition
+-- ─────────────────────────────────────────────────────────────────────────────
+
+/-- X ⊥ Y | Z for sets: every pair of members is d-separated (path-quantified). -/
+def dSepSet (G : ADMG V) (X Y Z : Finset V) : Prop :=
+  ∀ x ∈ X, ∀ y ∈ Y, G.dSep x y Z
+
+/-- X ⊥ Y | Z for sets, walk-quantified. -/
+def dSepSetWalk (G : ADMG V) (X Y Z : Finset V) : Prop :=
+  ∀ x ∈ X, ∀ y ∈ Y, G.dSepWalk x y Z
+
+lemma dSepSet_of_dSepSetWalk (G : ADMG V) (X Y Z : Finset V) (h : G.dSepSetWalk X Y Z) :
+    G.dSepSet X Y Z :=
+  fun x hx y hy => dSep_of_dSepWalk G x y Z (h x hx y hy)
+
+/-- Symmetry: X ⊥ Y | Z ↔ Y ⊥ X | Z -/
+theorem dSepSet_symm (G : ADMG V) (X Y Z : Finset V) :
+    G.dSepSet X Y Z ↔ G.dSepSet Y X Z := by
+  constructor
+  · intro h y hy x hx; exact dSep_symm G x y Z (h x hx y hy)
+  · intro h x hx y hy; exact dSep_symm G y x Z (h y hy x hx)
+
+theorem dSepSetWalk_symm (G : ADMG V) (X Y Z : Finset V) :
+    G.dSepSetWalk X Y Z ↔ G.dSepSetWalk Y X Z := by
+  constructor
+  · intro h y hy x hx; exact dSepWalk_symm G x y Z (h x hx y hy)
+  · intro h x hx y hy; exact dSepWalk_symm G y x Z (h y hy x hx)
+
+/-- Decomposition: X ⊥ Y ∪ W | Z → X ⊥ Y | Z ∧ X ⊥ W | Z
+    Purely structural: projects from union membership.  Holds identically
+    for `dSepSet` and `dSepSetWalk`. -/
+theorem dSepSet_decomp (G : ADMG V) (X Y W Z : Finset V) :
+    G.dSepSet X (Y ∪ W) Z → G.dSepSet X Y Z ∧ G.dSepSet X W Z := by
+  intro h
+  exact ⟨fun x hx y hy => h x hx y (Finset.mem_union.mpr (.inl hy)),
+         fun x hx w hw => h x hx w (Finset.mem_union.mpr (.inr hw))⟩
+
+theorem dSepSetWalk_decomp (G : ADMG V) (X Y W Z : Finset V) :
+    G.dSepSetWalk X (Y ∪ W) Z → G.dSepSetWalk X Y Z ∧ G.dSepSetWalk X W Z := by
+  intro h
+  exact ⟨fun x hx y hy => h x hx y (Finset.mem_union.mpr (.inl hy)),
+         fun x hx w hw => h x hx w (Finset.mem_union.mpr (.inr hw))⟩
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- §8. chainBuild and the Active Path Lemma (dSepWalk level)
+-- ─────────────────────────────────────────────────────────────────────────────
 
 /-- `v` itself, or a (directed-edge) descendant of `v`, lies in `S` — i.e.
-    `v ∈ An(S)`.  This is the collider-opening condition of m-separation. -/
+    `v ∈ An(S)`.  This is the collider-opening condition. -/
 def hasReflDescIn (G : ADMG V) (v : V) (S : Finset V) : Prop :=
   v ∈ S ∨ (G.descendants v ∩ S).Nonempty
 
@@ -389,536 +655,558 @@ lemma hasReflDescIn_union (G : ADMG V) (v : V) (Z W : Finset V) :
 
 /-- At a collider, the segment is unblocked exactly when the collider has a
     reflexive descendant in the conditioning set. -/
-lemma collider_seg_false_iff (G : ADMG V) (Z : Finset V) (p c n : V)
-    (h : G.isCollider p c n = true) :
-    G.segmentBlocked Z p c n = false ↔ G.hasReflDescIn c Z := by
-  unfold segmentBlocked hasReflDescIn
+lemma collider_seg_false_iff (G : ADMG V) (Z : Finset V) (c : V) (m1 m2 : Mark)
+    (h : isCollider m1 m2 = true) :
+    G.segmentBlocked Z c m1 m2 = false ↔ G.hasReflDescIn c Z := by
+  unfold ADMG.segmentBlocked hasReflDescIn
   rw [if_pos h, Bool.not_eq_false', Bool.or_eq_true, decide_eq_true_eq, decide_eq_true_eq]
 
-/-- At a non-collider, the segment is unblocked exactly when the node avoids the
-    conditioning set. -/
-lemma noncollider_seg_false_iff (G : ADMG V) (Z : Finset V) (p c n : V)
-    (h : G.isCollider p c n = false) :
-    G.segmentBlocked Z p c n = false ↔ c ∉ Z := by
-  unfold segmentBlocked
+/-- At a non-collider, the segment is unblocked exactly when the node avoids
+    the conditioning set. -/
+lemma noncollider_seg_false_iff (G : ADMG V) (Z : Finset V) (c : V) (m1 m2 : Mark)
+    (h : isCollider m1 m2 = false) :
+    G.segmentBlocked Z c m1 m2 = false ↔ c ∉ Z := by
+  unfold ADMG.segmentBlocked
   rw [if_neg (by rw [h]; simp), decide_eq_false_iff_not]
 
--- ── Verma's Active Path Lemma ────────────────────────────────────────────────
+/-- **chainBuild.** Given a descendant `w` of `q` (reachable within `n`
+    directed steps) all of whose reachable nodes avoid `Z`, with `q ∉ Z` and
+    `p` connected to `q` via a validated edge (mark `m0`), the directed chain
+    `p, q, …, w` (all subsequent steps `dirFwd`) is an unblocked walk ending
+    at `w`.  Every outgoing step uses `dirFwd`, which forces a non-collider
+    at each interior node REGARDLESS of the incoming mark — this is where
+    the mark-based design removes the need for bow-freeness. -/
+lemma chainBuild (G : ADMG V) (Z : Finset V) :
+    ∀ (n : ℕ) (q w p : V) (m0 : Mark),
+      w ∈ G.directedPart.reachableN n q →
+      (∀ u ∈ G.directedPart.reachableN n q, u ∉ Z) →
+      Mark.valid G p q m0 = true →
+      q ∉ Z →
+      ∃ (rtV : List V) (rtM : List Mark), G.IsWalk (p :: q :: rtV) (m0 :: rtM) ∧
+        (p :: q :: rtV).getLast? = some w ∧
+        G.pathBlocked Z (p :: q :: rtV) (m0 :: rtM) = false := by
+  intro n
+  induction n with
+  | zero => intro q w p m0 hw _ _ _; simp [DirectedGraph.reachableN] at hw
+  | succ m ih =>
+      intro q w p m0 hw hZ hpq hq
+      rw [mem_reachableN_succ] at hw
+      rcases hw with hwq | ⟨u, hu, hwu⟩
+      · -- edge q → w directly; chain p, q, w
+        have hqw : G.directed q w = true := (mem_outNeighbors G.directedPart q w).mp hwq
+        refine ⟨[w], [Mark.dirFwd], ?_, ?_, ?_⟩
+        · rw [isWalk_cons₂]
+          refine ⟨hpq, ?_⟩
+          rw [isWalk_cons₂]
+          exact ⟨hqw, isWalk_singleton G w⟩
+        · simp
+        · show (G.segmentBlocked Z q m0 Mark.dirFwd || G.pathBlocked Z [q, w] [Mark.dirFwd]) = false
+          rw [Bool.or_eq_false_iff]
+          exact ⟨segmentBlocked_chain G Z q m0 hq, rfl⟩
+      · -- edge q → u, then recurse from u to w
+        have hqu : G.directed q u = true := (mem_outNeighbors G.directedPart q u).mp hu
+        have huZ : u ∉ Z := hZ u (by rw [mem_reachableN_succ]; exact Or.inl hu)
+        have hsub : G.directedPart.reachableN m u ⊆ G.directedPart.reachableN (m + 1) q := by
+          intro x hx; rw [mem_reachableN_succ]; exact Or.inr ⟨u, hu, hx⟩
+        obtain ⟨rtV, rtM, hwalk, hlast, hblk⟩ :=
+          ih u w q Mark.dirFwd hwu (fun x hx => hZ x (hsub hx)) hqu huZ
+        refine ⟨u :: rtV, Mark.dirFwd :: rtM, ?_, ?_, ?_⟩
+        · rw [isWalk_cons₂]; exact ⟨hpq, hwalk⟩
+        · rw [List.getLast?_cons_cons]; exact hlast
+        · show (G.segmentBlocked Z q m0 Mark.dirFwd ||
+              G.pathBlocked Z (q :: u :: rtV) (Mark.dirFwd :: rtM)) = false
+          rw [Bool.or_eq_false_iff]
+          exact ⟨segmentBlocked_chain G Z q m0 hq, hblk⟩
 
-/-- **Active Path Lemma** (Verma & Pearl, adapted to m-separation).  If there
-    is an active walk from (the head of) `π` to a node `y ∈ Y` given `Z ∪ W`,
-    then there is an active walk with the SAME head to some node `b ∈ Y ∪ W`
-    given `Z`.
+/-- **Active Path Lemma** (Verma & Pearl, adapted to a marked mixed graph).
+    If there is an active walk from (the head of) `πV` to a node `y ∈ Y`
+    given `Z ∪ W`, then there is an active walk with the SAME head to some
+    node `b ∈ Y ∪ W` given `Z`.
 
-    Scanning from the head, let the gluing node be the first internal node
-    `V_k` that is either (a) in `W`, or (b) a collider with a reflexive
-    descendant in `W` but none in `Z`.  We recurse past every earlier internal
-    node (which is then active given `Z` too), and on reaching `V_k` we stop:
-    case (a) truncates the walk at `V_k`; case (b) glues on the directed path
-    to a `W`-descendant via `chainBuild`, turning `V_k` into a chain
-    non-collider (this is where bow-freeness and directed acyclicity are
-    used).  The extra conclusions (`head?` and the first-two-nodes are
-    preserved) are what allow the head to be re-attached recursively. -/
+    Scanning from the head, the gluing node is the first internal node `V_k`
+    that is either (a) in `W`, or (b) a collider with a reflexive descendant
+    in `W` but none in `Z`.  We recurse past every earlier internal node
+    (active given `Z` too), and on reaching `V_k` we stop: case (a) truncates
+    the walk there; case (b) glues on the directed chain to a `W`-descendant
+    via `chainBuild`, turning `V_k` into a chain non-collider.  The extra
+    "preserved prefix" conclusion is what lets the head be re-attached in the
+    recursive step (it must fix not just the head vertex but also the second
+    vertex and the mark between them, since the outer step needs to re-derive
+    the collider status at the second vertex). -/
 theorem active_path_lemma (G : ADMG V) (Y W Z : Finset V) :
-    ∀ (π : List V) (y : V), G.IsWalk π → π.getLast? = some y → y ∈ Y →
-      G.pathBlocked (Z ∪ W) π = false →
-      ∃ (π' : List V) (b : V), G.IsWalk π' ∧ π'.getLast? = some b ∧ b ∈ Y ∪ W ∧
-        G.pathBlocked Z π' = false ∧ π'.head? = π.head? ∧
-        (∀ a c t, π = a :: c :: t → ∃ t', π' = a :: c :: t') := by
-  intro π
-  match π with
+    ∀ (πV : List V) (πM : List Mark) (y : V), G.IsWalk πV πM →
+      πV.getLast? = some y → y ∈ Y → G.pathBlocked (Z ∪ W) πV πM = false →
+      ∃ (π'V : List V) (π'M : List Mark) (b : V), G.IsWalk π'V π'M ∧
+        π'V.getLast? = some b ∧ b ∈ Y ∪ W ∧
+        G.pathBlocked Z π'V π'M = false ∧ π'V.head? = πV.head? ∧
+        (∀ a c m t tm, πV = a :: c :: t → πM = m :: tm →
+          ∃ t' tm', π'V = a :: c :: t' ∧ π'M = m :: tm') := by
+  intro πV
+  match πV with
   | [] =>
-      intro y _ hl _ _; simp at hl
+      intro πM y _ hl _ _; simp at hl
   | [v] =>
-      intro y _ hl hy _
-      simp only [List.getLast?_singleton, Option.some.injEq] at hl
-      subst hl
-      exact ⟨[v], v, isWalk_singleton G v, rfl,
-        Finset.mem_union.mpr (Or.inl hy), rfl, rfl, by intro a c t h; simp at h⟩
+      intro πM y hw hl hy _
+      cases πM with
+      | nil =>
+        simp only [List.getLast?_singleton, Option.some.injEq] at hl
+        subst hl
+        refine ⟨[v], [], v, isWalk_singleton G v, rfl,
+          Finset.mem_union.mpr (Or.inl hy), rfl, rfl, ?_⟩
+        intro a c m t tm h _; simp at h
+      | cons _ _ => exact absurd hw (by simp [IsWalk])
   | [v, v2] =>
-      intro y hw hl hy _
+      intro πM y hw hl hy _
       simp only [List.getLast?_cons_cons, List.getLast?_singleton, Option.some.injEq] at hl
       subst hl
-      refine ⟨[v, v2], v2, hw, rfl, Finset.mem_union.mpr (Or.inl hy), rfl, rfl, ?_⟩
-      intro a c t h; exact ⟨t, h⟩
+      refine ⟨[v, v2], πM, v2, hw, rfl, Finset.mem_union.mpr (Or.inl hy), rfl, rfl, ?_⟩
+      intro a c m t tm h hm; exact ⟨t, tm, h, hm⟩
   | v :: v2 :: v3 :: rest =>
-      intro y hw hl hy hb
-      rw [isWalk_cons₂] at hw
-      obtain ⟨hadj, hwtail⟩ := hw
-      have hb2 : (G.segmentBlocked (Z ∪ W) v v2 v3 ||
-          G.pathBlocked (Z ∪ W) (v2 :: v3 :: rest)) = false := hb
-      obtain ⟨hseg, htail⟩ := Bool.or_eq_false_iff.mp hb2
-      rw [List.getLast?_cons_cons] at hl
-      by_cases ha : v2 ∈ W
-      · -- Case (a): V_k = v2 ∈ W; truncate to [v, v2].
-        refine ⟨[v, v2], v2, (isWalk_cons₂ G v v2 []).mpr ⟨hadj, isWalk_singleton G v2⟩, rfl,
-          Finset.mem_union.mpr (Or.inr ha), rfl, rfl, ?_⟩
-        intro a c t h
-        obtain ⟨rfl, hr⟩ := List.cons.inj h
-        obtain ⟨rfl, _⟩ := List.cons.inj hr
-        exact ⟨[], rfl⟩
-      · by_cases hbcase :
-          G.isCollider v v2 v3 = true ∧ G.hasReflDescIn v2 W ∧ ¬ G.hasReflDescIn v2 Z
-        · -- Case (b): glue the directed path to a W-descendant.
-          obtain ⟨_, hWdesc, hnoZ⟩ := hbcase
-          have hv2Z : v2 ∉ Z := fun h => hnoZ (Or.inl h)
-          have hallZ : ∀ u ∈ G.descendants v2, u ∉ Z := by
-            intro u hu huZ
-            exact hnoZ (Or.inr ⟨u, Finset.mem_inter.mpr ⟨hu, huZ⟩⟩)
-          obtain ⟨w, hw_desc, hwW⟩ : ∃ w, w ∈ G.descendants v2 ∧ w ∈ W := by
-            rcases hWdesc with h | ⟨x, hx⟩
-            · exact absurd h ha
-            · rw [Finset.mem_inter] at hx; exact ⟨x, hx.1, hx.2⟩
-          obtain ⟨rt, hwalk, hlast2, hblk2⟩ :=
-            chainBuild G Z (Fintype.card V) v2 w v hw_desc hallZ hadj hv2Z
-          refine ⟨v :: v2 :: rt, w, hwalk, hlast2,
-            Finset.mem_union.mpr (Or.inr hwW), hblk2, rfl, ?_⟩
-          intro a c t h
-          obtain ⟨rfl, hr⟩ := List.cons.inj h
-          obtain ⟨rfl, _⟩ := List.cons.inj hr
-          exact ⟨rt, rfl⟩
-        · -- Neither (a) nor (b): v2 is active given Z; recurse on the tail.
-          have hsegZ : G.segmentBlocked Z v v2 v3 = false := by
-            by_cases hcoll : G.isCollider v v2 v3 = true
-            · rw [collider_seg_false_iff G Z v v2 v3 hcoll]
-              have hU : G.hasReflDescIn v2 (Z ∪ W) :=
-                (collider_seg_false_iff G (Z ∪ W) v v2 v3 hcoll).mp hseg
-              rw [hasReflDescIn_union] at hU
-              rcases hU with hUZ | hUW
-              · exact hUZ
-              · by_contra hnz; exact hbcase ⟨hcoll, hUW, hnz⟩
-            · have hcf : G.isCollider v v2 v3 = false := by simpa using hcoll
-              rw [noncollider_seg_false_iff G Z v v2 v3 hcf]
-              have hv2 : v2 ∉ Z ∪ W :=
-                (noncollider_seg_false_iff G (Z ∪ W) v v2 v3 hcf).mp hseg
-              exact fun h => hv2 (Finset.mem_union.mpr (Or.inl h))
-          obtain ⟨π'', b, hw'', hlast'', hb'', hblk'', hhead'', hpre''⟩ :=
-            active_path_lemma G Y W Z (v2 :: v3 :: rest) y hwtail hl hy htail
-          obtain ⟨t', hπ''eq⟩ := hpre'' v2 v3 rest rfl
-          refine ⟨v :: π'', b, ?_, ?_, hb'', ?_, rfl, ?_⟩
-          · unfold IsWalk
-            rw [List.isChain_cons]
-            refine ⟨?_, hw''⟩
-            intro z hz
-            rw [hhead''] at hz
-            simp only [List.head?_cons, Option.mem_some_iff] at hz
-            subst hz; exact hadj
-          · rw [hπ''eq, List.getLast?_cons_cons, ← hπ''eq]; exact hlast''
-          · rw [hπ''eq]
-            show (G.segmentBlocked Z v v2 v3 || G.pathBlocked Z (v2 :: v3 :: t')) = false
-            rw [Bool.or_eq_false_iff]
-            refine ⟨hsegZ, ?_⟩; rw [← hπ''eq]; exact hblk''
-          · intro a c t h
+      intro πM y hw hl hy hb
+      cases πM with
+      | nil => exact absurd hw (by simp [IsWalk])
+      | cons m1 πM' =>
+        cases πM' with
+        | nil => exact absurd hw (by simp [IsWalk])
+        | cons m2 πM'' =>
+          rw [isWalk_cons₂] at hw
+          obtain ⟨hadj, hwtail⟩ := hw
+          have hb2 : (G.segmentBlocked (Z ∪ W) v2 m1 m2 ||
+              G.pathBlocked (Z ∪ W) (v2 :: v3 :: rest) (m2 :: πM'')) = false := hb
+          obtain ⟨hseg, htail⟩ := Bool.or_eq_false_iff.mp hb2
+          rw [List.getLast?_cons_cons] at hl
+          by_cases ha : v2 ∈ W
+          · -- Case (a): V_k = v2 ∈ W; truncate to [v, v2].
+            refine ⟨[v, v2], [m1], v2,
+              (isWalk_cons₂ G v v2 m1 [] []).mpr ⟨hadj, isWalk_singleton G v2⟩, rfl,
+              Finset.mem_union.mpr (Or.inr ha), rfl, rfl, ?_⟩
+            intro a c m t tm h hm
             obtain ⟨rfl, hr⟩ := List.cons.inj h
             obtain ⟨rfl, _⟩ := List.cons.inj hr
-            exact ⟨v3 :: t', by rw [hπ''eq]⟩
-  termination_by π => π.length
+            obtain ⟨rfl, _⟩ := List.cons.inj hm
+            exact ⟨[], [], rfl, rfl⟩
+          · by_cases hbcase :
+              isCollider m1 m2 = true ∧ G.hasReflDescIn v2 W ∧ ¬ G.hasReflDescIn v2 Z
+            · -- Case (b): glue the directed path to a W-descendant.
+              obtain ⟨_, hWdesc, hnoZ⟩ := hbcase
+              have hv2Z : v2 ∉ Z := fun h => hnoZ (Or.inl h)
+              have hallZ : ∀ u ∈ G.descendants v2, u ∉ Z := by
+                intro u hu huZ
+                exact hnoZ (Or.inr ⟨u, Finset.mem_inter.mpr ⟨hu, huZ⟩⟩)
+              obtain ⟨w, hw_desc, hwW⟩ : ∃ w, w ∈ G.descendants v2 ∧ w ∈ W := by
+                rcases hWdesc with h | ⟨x, hx⟩
+                · exact absurd h ha
+                · rw [Finset.mem_inter] at hx; exact ⟨x, hx.1, hx.2⟩
+              obtain ⟨rtV, rtM, hwalk, hlast2, hblk2⟩ :=
+                chainBuild G Z (Fintype.card V) v2 w v m1 hw_desc hallZ hadj hv2Z
+              refine ⟨v :: v2 :: rtV, m1 :: rtM, w, hwalk, hlast2,
+                Finset.mem_union.mpr (Or.inr hwW), hblk2, rfl, ?_⟩
+              intro a c m t tm h hm
+              obtain ⟨rfl, hr⟩ := List.cons.inj h
+              obtain ⟨rfl, _⟩ := List.cons.inj hr
+              obtain ⟨rfl, _⟩ := List.cons.inj hm
+              exact ⟨rtV, rtM, rfl, rfl⟩
+            · -- Neither (a) nor (b): v2 is active given Z; recurse on the tail.
+              have hsegZ : G.segmentBlocked Z v2 m1 m2 = false := by
+                by_cases hcoll : isCollider m1 m2 = true
+                · rw [collider_seg_false_iff G Z v2 m1 m2 hcoll]
+                  have hU : G.hasReflDescIn v2 (Z ∪ W) :=
+                    (collider_seg_false_iff G (Z ∪ W) v2 m1 m2 hcoll).mp hseg
+                  rw [hasReflDescIn_union] at hU
+                  rcases hU with hUZ | hUW
+                  · exact hUZ
+                  · by_contra hnz; exact hbcase ⟨hcoll, hUW, hnz⟩
+                · have hcf : isCollider m1 m2 = false := by simpa using hcoll
+                  rw [noncollider_seg_false_iff G Z v2 m1 m2 hcf]
+                  have hv2 : v2 ∉ Z ∪ W :=
+                    (noncollider_seg_false_iff G (Z ∪ W) v2 m1 m2 hcf).mp hseg
+                  exact fun h => hv2 (Finset.mem_union.mpr (Or.inl h))
+              obtain ⟨π''V, π''M, b, hw'', hlast'', hb'', hblk'', hhead'', hpre''⟩ :=
+                active_path_lemma G Y W Z (v2 :: v3 :: rest) (m2 :: πM'') y hwtail hl hy htail
+              obtain ⟨t', tm', hπ''Veq, hπ''Meq⟩ := hpre'' v2 v3 m2 rest πM'' rfl rfl
+              refine ⟨v :: π''V, m1 :: π''M, b, ?_, ?_, hb'', ?_, rfl, ?_⟩
+              · rw [hπ''Veq, hπ''Meq, isWalk_cons₂]
+                exact ⟨hadj, by rw [← hπ''Veq, ← hπ''Meq]; exact hw''⟩
+              · rw [hπ''Veq, List.getLast?_cons_cons, ← hπ''Veq]; exact hlast''
+              · rw [hπ''Veq, hπ''Meq]
+                show (G.segmentBlocked Z v2 m1 m2 ||
+                    G.pathBlocked Z (v2 :: v3 :: t') (m2 :: tm')) = false
+                rw [Bool.or_eq_false_iff]
+                refine ⟨hsegZ, ?_⟩
+                rw [← hπ''Veq, ← hπ''Meq]
+                exact hblk''
+              · intro a c m t tm h hm
+                obtain ⟨rfl, hr⟩ := List.cons.inj h
+                obtain ⟨rfl, _⟩ := List.cons.inj hr
+                obtain ⟨rfl, _⟩ := List.cons.inj hm
+                exact ⟨v3 :: t', m2 :: tm', by rw [hπ''Veq], by rw [hπ''Meq]⟩
+  termination_by πV => πV.length
   decreasing_by simp_wf
 
-/-- **Contraction helper.**  Scanning an active walk given `Z` from the head: it
-    is either still active given `Z ∪ Y`, or its first non-collider in `Y` cuts
-    off a prefix that is an active walk from the same head to a node of `Y` given
-    `Z`.  (Enlarging the conditioning set from `Z` to `Z ∪ Y` can only newly
-    block a non-collider that lies in `Y`; colliders stay open.) -/
+/-- **Contraction helper.**  Scanning an active walk given `Z` from the head:
+    it is either still active given `Z ∪ Y`, or its first non-collider in
+    `Y` cuts off a prefix that is an active walk from the same head to a
+    node of `Y` given `Z`. -/
 theorem contraction_walk (G : ADMG V) (Y Z : Finset V) :
-    ∀ (π : List V), G.IsWalk π → G.pathBlocked Z π = false →
-      G.pathBlocked (Z ∪ Y) π = false ∨
-      (∃ (π' : List V) (y' : V), G.IsWalk π' ∧ π'.head? = π.head? ∧
-        π'.getLast? = some y' ∧ y' ∈ Y ∧ G.pathBlocked Z π' = false ∧
-        (∀ a c t, π = a :: c :: t → ∃ t', π' = a :: c :: t') ∧
-        π'.length < π.length) := by
-  intro π
-  match π with
-  | [] => intro _ _; exact Or.inl rfl
-  | [v] => intro _ _; exact Or.inl rfl
-  | [v, v2] => intro _ _; exact Or.inl rfl
+    ∀ (πV : List V) (πM : List Mark), G.IsWalk πV πM → G.pathBlocked Z πV πM = false →
+      G.pathBlocked (Z ∪ Y) πV πM = false ∨
+      (∃ (π'V : List V) (π'M : List Mark) (y' : V), G.IsWalk π'V π'M ∧
+        π'V.head? = πV.head? ∧ π'V.getLast? = some y' ∧ y' ∈ Y ∧
+        G.pathBlocked Z π'V π'M = false ∧
+        (∀ a c m t tm, πV = a :: c :: t → πM = m :: tm →
+          ∃ t' tm', π'V = a :: c :: t' ∧ π'M = m :: tm') ∧
+        π'V.length < πV.length) := by
+  intro πV
+  match πV with
+  | [] => intro πM _ _; exact Or.inl rfl
+  | [v] => intro πM _ _; exact Or.inl rfl
+  | [v, v2] => intro πM _ _; exact Or.inl rfl
   | v :: v2 :: v3 :: rest =>
-      intro hw hb
-      rw [isWalk_cons₂] at hw
-      obtain ⟨hadj, hwtail⟩ := hw
-      have hb2 : (G.segmentBlocked Z v v2 v3 || G.pathBlocked Z (v2 :: v3 :: rest)) = false := hb
-      obtain ⟨hseg, htail⟩ := Bool.or_eq_false_iff.mp hb2
-      by_cases hfound : v2 ∈ Y ∧ G.isCollider v v2 v3 = false
-      · -- First non-collider in Y: cut the prefix [v, v2].
-        refine Or.inr ⟨[v, v2], v2, (isWalk_cons₂ G v v2 []).mpr ⟨hadj, isWalk_singleton G v2⟩,
-          rfl, rfl, hfound.1, rfl, ?_, ?_⟩
-        · intro a c t h
-          obtain ⟨rfl, hr⟩ := List.cons.inj h
-          obtain ⟨rfl, _⟩ := List.cons.inj hr
-          exact ⟨[], rfl⟩
-        · simp only [List.length_cons, List.length_nil]; omega
-      · -- v2 remains unblocked under Z ∪ Y; recurse on the tail.
-        have hsegZY : G.segmentBlocked (Z ∪ Y) v v2 v3 = false := by
-          by_cases hcoll : G.isCollider v v2 v3 = true
-          · rw [collider_seg_false_iff G (Z ∪ Y) v v2 v3 hcoll, hasReflDescIn_union]
-            exact Or.inl ((collider_seg_false_iff G Z v v2 v3 hcoll).mp hseg)
-          · have hcf : G.isCollider v v2 v3 = false := by simpa using hcoll
-            rw [noncollider_seg_false_iff G (Z ∪ Y) v v2 v3 hcf]
-            have hv2Z : v2 ∉ Z := (noncollider_seg_false_iff G Z v v2 v3 hcf).mp hseg
-            have hv2Y : v2 ∉ Y := fun h => hfound ⟨h, hcf⟩
-            exact fun h => (Finset.mem_union.mp h).elim hv2Z hv2Y
-        rcases contraction_walk G Y Z (v2 :: v3 :: rest) hwtail htail with
-          hZY | ⟨π'', y', hw'', hhead'', hlast'', hyY, hblk'', hpre'', hlen''⟩
-        · refine Or.inl ?_
-          show (G.segmentBlocked (Z ∪ Y) v v2 v3 || G.pathBlocked (Z ∪ Y) (v2 :: v3 :: rest)) = false
-          rw [Bool.or_eq_false_iff]; exact ⟨hsegZY, hZY⟩
-        · obtain ⟨t', hπ''eq⟩ := hpre'' v2 v3 rest rfl
-          refine Or.inr ⟨v :: π'', y', ?_, rfl, ?_, hyY, ?_, ?_, ?_⟩
-          · unfold IsWalk
-            rw [List.isChain_cons]
-            refine ⟨?_, hw''⟩
-            intro z hz; rw [hhead''] at hz
-            simp only [List.head?_cons, Option.mem_some_iff] at hz
-            subst hz; exact hadj
-          · rw [hπ''eq, List.getLast?_cons_cons, ← hπ''eq]; exact hlast''
-          · rw [hπ''eq]
-            show (G.segmentBlocked Z v v2 v3 || G.pathBlocked Z (v2 :: v3 :: t')) = false
-            rw [Bool.or_eq_false_iff]; refine ⟨hseg, ?_⟩; rw [← hπ''eq]; exact hblk''
-          · intro a c t h
-            obtain ⟨rfl, hr⟩ := List.cons.inj h
-            obtain ⟨rfl, _⟩ := List.cons.inj hr
-            exact ⟨v3 :: t', by rw [hπ''eq]⟩
-          · simp only [List.length_cons] at hlen'' ⊢; omega
-  termination_by π => π.length
+      intro πM hw hb
+      cases πM with
+      | nil => exact absurd hw (by simp [IsWalk])
+      | cons m1 πM' =>
+        cases πM' with
+        | nil => exact absurd hw (by simp [IsWalk])
+        | cons m2 πM'' =>
+          rw [isWalk_cons₂] at hw
+          obtain ⟨hadj, hwtail⟩ := hw
+          have hb2 : (G.segmentBlocked Z v2 m1 m2 ||
+              G.pathBlocked Z (v2 :: v3 :: rest) (m2 :: πM'')) = false := hb
+          obtain ⟨hseg, htail⟩ := Bool.or_eq_false_iff.mp hb2
+          by_cases hfound : v2 ∈ Y ∧ isCollider m1 m2 = false
+          · -- First non-collider in Y: cut the prefix [v, v2].
+            refine Or.inr ⟨[v, v2], [m1], v2,
+              (isWalk_cons₂ G v v2 m1 [] []).mpr ⟨hadj, isWalk_singleton G v2⟩,
+              rfl, rfl, hfound.1, rfl, ?_, ?_⟩
+            · intro a c m t tm h hm
+              obtain ⟨rfl, hr⟩ := List.cons.inj h
+              obtain ⟨rfl, _⟩ := List.cons.inj hr
+              obtain ⟨rfl, _⟩ := List.cons.inj hm
+              exact ⟨[], [], rfl, rfl⟩
+            · simp only [List.length_cons, List.length_nil]; omega
+          · -- v2 remains unblocked under Z ∪ Y; recurse on the tail.
+            have hsegZY : G.segmentBlocked (Z ∪ Y) v2 m1 m2 = false := by
+              by_cases hcoll : isCollider m1 m2 = true
+              · rw [collider_seg_false_iff G (Z ∪ Y) v2 m1 m2 hcoll, hasReflDescIn_union]
+                exact Or.inl ((collider_seg_false_iff G Z v2 m1 m2 hcoll).mp hseg)
+              · have hcf : isCollider m1 m2 = false := by simpa using hcoll
+                rw [noncollider_seg_false_iff G (Z ∪ Y) v2 m1 m2 hcf]
+                have hv2Z : v2 ∉ Z := (noncollider_seg_false_iff G Z v2 m1 m2 hcf).mp hseg
+                have hv2Y : v2 ∉ Y := fun h => hfound ⟨h, hcf⟩
+                exact fun h => (Finset.mem_union.mp h).elim hv2Z hv2Y
+            rcases contraction_walk G Y Z (v2 :: v3 :: rest) (m2 :: πM'') hwtail htail with
+              hZY | ⟨π''V, π''M, y', hw'', hhead'', hlast'', hyY, hblk'', hpre'', hlen''⟩
+            · refine Or.inl ?_
+              show (G.segmentBlocked (Z ∪ Y) v2 m1 m2 ||
+                  G.pathBlocked (Z ∪ Y) (v2 :: v3 :: rest) (m2 :: πM'')) = false
+              rw [Bool.or_eq_false_iff]; exact ⟨hsegZY, hZY⟩
+            · obtain ⟨t', tm', hπ''Veq, hπ''Meq⟩ := hpre'' v2 v3 m2 rest πM'' rfl rfl
+              refine Or.inr ⟨v :: π''V, m1 :: π''M, y', ?_, rfl, ?_, hyY, ?_, ?_, ?_⟩
+              · rw [hπ''Veq, hπ''Meq, isWalk_cons₂]
+                exact ⟨hadj, by rw [← hπ''Veq, ← hπ''Meq]; exact hw''⟩
+              · rw [hπ''Veq, List.getLast?_cons_cons, ← hπ''Veq]; exact hlast''
+              · rw [hπ''Veq, hπ''Meq]
+                show (G.segmentBlocked Z v2 m1 m2 ||
+                    G.pathBlocked Z (v2 :: v3 :: t') (m2 :: tm')) = false
+                rw [Bool.or_eq_false_iff]
+                refine ⟨hseg, ?_⟩
+                rw [← hπ''Veq, ← hπ''Meq]
+                exact hblk''
+              · intro a c m t tm h hm
+                obtain ⟨rfl, hr⟩ := List.cons.inj h
+                obtain ⟨rfl, _⟩ := List.cons.inj hr
+                obtain ⟨rfl, _⟩ := List.cons.inj hm
+                exact ⟨v3 :: t', m2 :: tm', by rw [hπ''Veq], by rw [hπ''Meq]⟩
+              · simp only [List.length_cons] at hlen'' ⊢; omega
+  termination_by πV => πV.length
   decreasing_by simp_wf
 
-/-- **Intersection helper.**  An active walk given `Z` ending in `Y ∪ W` can be
-    re-routed (by alternately applying `contraction_walk` to `W` and to `Y`) into
-    either an active walk to `Y` given `Z ∪ W`, or an active walk to `W` given
-    `Z ∪ Y`, with the same head.  The alternation terminates because each
-    `contraction_walk` cut produces a strictly shorter walk. -/
+/-- **Intersection helper.**  An active walk given `Z` ending in `Y ∪ W` can
+    be re-routed (by alternately applying `contraction_walk` to `W` and to
+    `Y`) into either an active walk to `Y` given `Z ∪ W`, or an active walk
+    to `W` given `Z ∪ Y`, with the same head. -/
 theorem intersection_walk (G : ADMG V) (Y W Z : Finset V) :
-    ∀ (π : List V) (t : V), G.IsWalk π → G.pathBlocked Z π = false →
-      π.getLast? = some t → t ∈ Y ∪ W →
-      (∃ (πa : List V) (a : V), G.IsWalk πa ∧ πa.head? = π.head? ∧
-          πa.getLast? = some a ∧ a ∈ Y ∧ G.pathBlocked (Z ∪ W) πa = false) ∨
-      (∃ (πb : List V) (b : V), G.IsWalk πb ∧ πb.head? = π.head? ∧
-          πb.getLast? = some b ∧ b ∈ W ∧ G.pathBlocked (Z ∪ Y) πb = false) := by
-  intro π t hwalk hactive hlast htYW
+    ∀ (πV : List V) (πM : List Mark) (t : V), G.IsWalk πV πM →
+      G.pathBlocked Z πV πM = false → πV.getLast? = some t → t ∈ Y ∪ W →
+      (∃ (πaV : List V) (πaM : List Mark) (a : V), G.IsWalk πaV πaM ∧
+          πaV.head? = πV.head? ∧ πaV.getLast? = some a ∧ a ∈ Y ∧
+          G.pathBlocked (Z ∪ W) πaV πaM = false) ∨
+      (∃ (πbV : List V) (πbM : List Mark) (b : V), G.IsWalk πbV πbM ∧
+          πbV.head? = πV.head? ∧ πbV.getLast? = some b ∧ b ∈ W ∧
+          G.pathBlocked (Z ∪ Y) πbV πbM = false) := by
+  intro πV πM t hwalk hactive hlast htYW
   rcases Finset.mem_union.mp htYW with hY | hW
-  · -- last node in Y: try to keep it active given Z ∪ W (enlarge by W).
-    rcases contraction_walk G W Z π hwalk hactive with
-      hZW | ⟨π', w', hw', hhead', hlast', hw'W, hblk', _, hlen'⟩
-    · exact Or.inl ⟨π, t, hwalk, rfl, hlast, hY, hZW⟩
-    · rcases intersection_walk G Y W Z π' w' hw' hblk' hlast'
+  · rcases contraction_walk G W Z πV πM hwalk hactive with
+      hZW | ⟨π'V, π'M, w', hw', hhead', hlast', hw'W, hblk', _, hlen'⟩
+    · exact Or.inl ⟨πV, πM, t, hwalk, rfl, hlast, hY, hZW⟩
+    · rcases intersection_walk G Y W Z π'V π'M w' hw' hblk' hlast'
           (Finset.mem_union.mpr (Or.inr hw'W)) with
-        ⟨πa, a, hwa, hha, hla, haY, hba⟩ | ⟨πb, b, hwb, hhb, hlb, hbW, hbb⟩
-      · exact Or.inl ⟨πa, a, hwa, hha.trans hhead', hla, haY, hba⟩
-      · exact Or.inr ⟨πb, b, hwb, hhb.trans hhead', hlb, hbW, hbb⟩
-  · -- last node in W: try to keep it active given Z ∪ Y (enlarge by Y).
-    rcases contraction_walk G Y Z π hwalk hactive with
-      hZY | ⟨π', y', hw', hhead', hlast', hy'Y, hblk', _, hlen'⟩
-    · exact Or.inr ⟨π, t, hwalk, rfl, hlast, hW, hZY⟩
-    · rcases intersection_walk G Y W Z π' y' hw' hblk' hlast'
+        ⟨πaV, πaM, a, hwa, hha, hla, haY, hba⟩ | ⟨πbV, πbM, b, hwb, hhb, hlb, hbW, hbb⟩
+      · exact Or.inl ⟨πaV, πaM, a, hwa, hha.trans hhead', hla, haY, hba⟩
+      · exact Or.inr ⟨πbV, πbM, b, hwb, hhb.trans hhead', hlb, hbW, hbb⟩
+  · rcases contraction_walk G Y Z πV πM hwalk hactive with
+      hZY | ⟨π'V, π'M, y', hw', hhead', hlast', hy'Y, hblk', _, hlen'⟩
+    · exact Or.inr ⟨πV, πM, t, hwalk, rfl, hlast, hW, hZY⟩
+    · rcases intersection_walk G Y W Z π'V π'M y' hw' hblk' hlast'
           (Finset.mem_union.mpr (Or.inl hy'Y)) with
-        ⟨πa, a, hwa, hha, hla, haY, hba⟩ | ⟨πb, b, hwb, hhb, hlb, hbW, hbb⟩
-      · exact Or.inl ⟨πa, a, hwa, hha.trans hhead', hla, haY, hba⟩
-      · exact Or.inr ⟨πb, b, hwb, hhb.trans hhead', hlb, hbW, hbb⟩
-  termination_by π => π.length
+        ⟨πaV, πaM, a, hwa, hha, hla, haY, hba⟩ | ⟨πbV, πbM, b, hwb, hhb, hlb, hbW, hbb⟩
+      · exact Or.inl ⟨πaV, πaM, a, hwa, hha.trans hhead', hla, haY, hba⟩
+      · exact Or.inr ⟨πbV, πbM, b, hwb, hhb.trans hhead', hlb, hbW, hbb⟩
+  termination_by πV => πV.length
   decreasing_by all_goals omega
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §5. Symmetry of m-separation
+-- §9. Weak Union, Contraction, Intersection (dSepSetWalk level)
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- isCollider is symmetric: the && of two Bool values is commutative.
-private lemma isCollider_symm (G : ADMG V) (prev curr next : V) :
-    G.isCollider prev curr next = G.isCollider next curr prev := by
-  simp [isCollider, Bool.and_comm]
-
--- segmentBlocked depends on isCollider and curr only, so it inherits symmetry.
-private lemma segmentBlocked_symm (G : ADMG V) (Z : Finset V) (prev curr next : V) :
-    G.segmentBlocked Z prev curr next = G.segmentBlocked Z next curr prev := by
-  simp [segmentBlocked, isCollider_symm]
-
--- A uniform one-step unfolding of `pathBlocked` valid for ALL tails `l`
--- (the raw definition only fires on a literal three-element prefix).
-private lemma pathBlocked_cons_cons (G : ADMG V) (Z : Finset V) (a b : V) (l : List V) :
-    G.pathBlocked Z (a :: b :: l)
-      = ((l.head?.elim false (fun n => G.segmentBlocked Z a b n)) || G.pathBlocked Z (b :: l)) := by
-  cases l <;> rfl
-
--- One-step unfolding peeling a single head from an arbitrary list.
-private lemma pathBlocked_cons (G : ADMG V) (Z : Finset V) (a : V) (L : List V) :
-    G.pathBlocked Z (a :: L)
-      = ((L.head?.elim false
-            (fun b => L.tail.head?.elim false (fun n => G.segmentBlocked Z a b n)))
-          || G.pathBlocked Z L) := by
-  cases L with
-  | nil => rfl
-  | cons b L' => cases L' <;> rfl
-
--- Appending a node to a walk that already ends in two known nodes `c, b`
--- only adds the boundary segment `(c, b, x)`.
-private lemma pathBlocked_snoc (G : ADMG V) (Z : Finset V) :
-    ∀ (pre : List V) (c b x : V),
-      G.pathBlocked Z (pre ++ [c, b, x])
-        = (G.pathBlocked Z (pre ++ [c, b]) || G.segmentBlocked Z c b x) := by
-  intro pre
-  induction pre with
-  | nil => intro c b x; simp [pathBlocked]
-  | cons p pre ih =>
-      intro c b x
-      simp only [List.cons_append]
-      rw [pathBlocked_cons (a := p) (L := pre ++ [c, b, x]),
-          pathBlocked_cons (a := p) (L := pre ++ [c, b]), ih]
-      have h1 : (pre ++ [c, b, x]).head? = (pre ++ [c, b]).head? := by cases pre <;> rfl
-      have h2 : (pre ++ [c, b, x]).tail.head? = (pre ++ [c, b]).tail.head? := by
-        cases pre with
-        | nil => rfl
-        | cons q pre' => cases pre' <;> rfl
-      rw [h1, h2, Bool.or_assoc]
-
--- Reversing a walk preserves blocking: the multiset of consecutive triples is
--- reversed and each triple is flipped, and `segmentBlocked` is flip-symmetric.
-private lemma pathBlocked_reverse (G : ADMG V) (Z : Finset V) (path : List V) :
-    G.pathBlocked Z path.reverse = G.pathBlocked Z path := by
-  induction path with
-  | nil => rfl
-  | cons a t iht =>
-    match t, iht with
-    | [], _ => rfl
-    | [b], _ => rfl
-    | b :: h :: t'', iht =>
-        have hrev : (a :: b :: h :: t'').reverse = t''.reverse ++ [h, b, a] := by
-          simp [List.reverse_cons]
-        have hrev2 : t''.reverse ++ [h, b] = (b :: h :: t'').reverse := by
-          simp [List.reverse_cons]
-        rw [hrev, pathBlocked_snoc, hrev2, iht,
-            pathBlocked_cons_cons (a := a) (b := b) (l := h :: t'')]
-        simp only [List.head?_cons, Option.elim_some]
-        rw [segmentBlocked_symm G Z a b h, Bool.or_comm]
-
-/-- m-Separation is symmetric: X ⊥ Y | Z → Y ⊥ X | Z -/
-theorem mSep_symm (G : ADMG V) (X Y : V) (Z : Finset V)
-    (h : mSep G X Y Z) : mSep G Y X Z := by
-  intro path hwalk hhead hlast
-  rw [← pathBlocked_reverse G Z path]
-  apply h
-  · exact (isWalk_reverse G path).mpr hwalk
-  · rwa [List.head?_reverse]
-  · rwa [List.getLast?_reverse]
-
--- ─────────────────────────────────────────────────────────────────────────────
--- §6. Set-level m-separation and the graphoid axioms
--- ─────────────────────────────────────────────────────────────────────────────
-
-/-- X ⊥ Y | Z for sets: every pair of members is m-separated. -/
-def mSepSet (G : ADMG V) (X Y Z : Finset V) : Prop :=
-  ∀ x ∈ X, ∀ y ∈ Y, G.mSep x y Z
-
-/-- Symmetry: X ⊥ Y | Z ↔ Y ⊥ X | Z -/
-theorem mSepSet_symm (G : ADMG V) (X Y Z : Finset V) :
-    G.mSepSet X Y Z ↔ G.mSepSet Y X Z := by
-  simp only [mSepSet]
-  constructor
-  · intro h y hy x hx
-    exact mSep_symm G x y Z (h x hx y hy)
-  · intro h x hx y hy
-    exact mSep_symm G y x Z (h y hy x hx)
-
-/-- Decomposition: X ⊥ Y ∪ W | Z → X ⊥ Y | Z ∧ X ⊥ W | Z
-    Purely structural: projects from union membership. -/
-theorem mSepSet_decomp (G : ADMG V) (X Y W Z : Finset V) :
-    G.mSepSet X (Y ∪ W) Z → G.mSepSet X Y Z ∧ G.mSepSet X W Z := by
-  intro h
-  exact ⟨fun x hx y hy => h x hx y (Finset.mem_union.mpr (.inl hy)),
-         fun x hx w hw => h x hx w (Finset.mem_union.mpr (.inr hw))⟩
-
-/-- One direction of Weak Union, proved by the contrapositive through the
-    Active Path Lemma: an active walk from `X` to `Y` given `Z ∪ W` yields an
-    active walk from `X` to `Y ∪ W` given `Z`, contradicting `X ⊥ Y ∪ W | Z`. -/
 private lemma weak_union_half (G : ADMG V) (X Y W Z : Finset V)
-    (h : G.mSepSet X (Y ∪ W) Z) : G.mSepSet X Y (Z ∪ W) := by
-  intro x hx y hy π hwalk hhead hlast
+    (h : G.dSepSetWalk X (Y ∪ W) Z) : G.dSepSetWalk X Y (Z ∪ W) := by
+  intro x hx y hy πV πM hwalk hhead hlast
   by_contra hne
   rw [Bool.not_eq_true] at hne
-  obtain ⟨π', b, hw', hlast', hb', hblk', hhead', _⟩ :=
-    active_path_lemma G Y W Z π y hwalk hlast hy hne
-  have hxb : G.mSep x b Z := h x hx b hb'
-  have hcontra : G.pathBlocked Z π' = true := hxb π' hw' (by rw [hhead', hhead]) hlast'
+  obtain ⟨π'V, π'M, b, hw', hlast', hb', hblk', hhead', _⟩ :=
+    active_path_lemma G Y W Z πV πM y hwalk hlast hy hne
+  have hxb : G.dSepWalk x b Z := h x hx b hb'
+  have hcontra : G.pathBlocked Z π'V π'M = true := hxb π'V π'M hw' (by rw [hhead', hhead]) hlast'
   rw [hblk'] at hcontra
   exact absurd hcontra (by simp)
 
-/-- **Weak Union** for m-separation: X ⊥ Y ∪ W | Z → X ⊥ Y | Z ∪ W ∧ X ⊥ W | Z ∪ Y.
-    Proved directly from the m-separation definition via Verma's Active Path
-    Lemma (`active_path_lemma`).  Both conjuncts follow from
-    `weak_union_half`, the second by swapping the roles of Y and W. -/
-theorem mSepSet_weak_union (G : ADMG V) (X Y W Z : Finset V) :
-    G.mSepSet X (Y ∪ W) Z →
-    G.mSepSet X Y (Z ∪ W) ∧ G.mSepSet X W (Z ∪ Y) := by
+/-- **Weak Union** for `dSepWalk`: X ⊥ Y ∪ W | Z → X ⊥ Y | Z ∪ W ∧ X ⊥ W | Z ∪ Y. -/
+theorem dSepSetWalk_weak_union (G : ADMG V) (X Y W Z : Finset V) :
+    G.dSepSetWalk X (Y ∪ W) Z →
+    G.dSepSetWalk X Y (Z ∪ W) ∧ G.dSepSetWalk X W (Z ∪ Y) := by
   intro h
   refine ⟨weak_union_half G X Y W Z h, ?_⟩
-  have h' : G.mSepSet X (W ∪ Y) Z := by rw [Finset.union_comm]; exact h
+  have h' : G.dSepSetWalk X (W ∪ Y) Z := by rw [Finset.union_comm]; exact h
   exact weak_union_half G X W Y Z h'
 
-/-- **Contraction**: X ⊥ Y | Z ∧ X ⊥ W | Z ∪ Y → X ⊥ Y ∪ W | Z.
-    The Y-branch closes directly from `h1`.  For the W-branch, an active walk
-    `x → w` given `Z` is, by `contraction_walk`, either active given `Z ∪ Y`
-    (contradicting `h2`) or has an active prefix `x → y' ∈ Y` given `Z`
-    (contradicting `h1`); hence no such walk exists. -/
-theorem mSepSet_contraction (G : ADMG V) (X Y W Z : Finset V) :
-    G.mSepSet X Y Z → G.mSepSet X W (Z ∪ Y) → G.mSepSet X (Y ∪ W) Z := by
+/-- **Contraction** for `dSepWalk`: X ⊥ Y | Z ∧ X ⊥ W | Z ∪ Y → X ⊥ Y ∪ W | Z. -/
+theorem dSepSetWalk_contraction (G : ADMG V) (X Y W Z : Finset V) :
+    G.dSepSetWalk X Y Z → G.dSepSetWalk X W (Z ∪ Y) → G.dSepSetWalk X (Y ∪ W) Z := by
   intro h1 h2 x hx yw hyw
   rcases Finset.mem_union.mp hyw with hy | hw
   · exact h1 x hx yw hy
-  · intro π hwalk hhead hlast
+  · intro πV πM hwalk hhead hlast
     by_contra hne
     rw [Bool.not_eq_true] at hne
-    rcases contraction_walk G Y Z π hwalk hne with
-      hZY | ⟨π', y', hw', hhead', hlast', hyY, hblk', _, _⟩
-    · have hc : G.pathBlocked (Z ∪ Y) π = true := h2 x hx yw hw π hwalk hhead hlast
+    rcases contraction_walk G Y Z πV πM hwalk hne with
+      hZY | ⟨π'V, π'M, y', hw', hhead', hlast', hyY, hblk', _, _⟩
+    · have hc : G.pathBlocked (Z ∪ Y) πV πM = true := h2 x hx yw hw πV πM hwalk hhead hlast
       rw [hZY] at hc; exact absurd hc (by simp)
-    · have hc : G.pathBlocked Z π' = true :=
-        h1 x hx y' hyY π' hw' (by rw [hhead', hhead]) hlast'
+    · have hc : G.pathBlocked Z π'V π'M = true :=
+        h1 x hx y' hyY π'V π'M hw' (by rw [hhead', hhead]) hlast'
       rw [hblk'] at hc; exact absurd hc (by simp)
 
-/-- m-Separation on (bow-free) ADMGs satisfies all four semi-graphoid axioms —
-    Symmetry, Decomposition, Weak Union, and Contraction — fully proved. -/
-theorem mSep_semigraphoid (G : ADMG V) :
-    (∀ X Y Z : Finset V, G.mSepSet X Y Z ↔ G.mSepSet Y X Z) ∧
-    (∀ X Y W Z : Finset V, G.mSepSet X (Y ∪ W) Z → G.mSepSet X Y Z ∧ G.mSepSet X W Z) ∧
-    (∀ X Y W Z : Finset V, G.mSepSet X (Y ∪ W) Z →
-        G.mSepSet X Y (Z ∪ W) ∧ G.mSepSet X W (Z ∪ Y)) ∧
-    (∀ X Y W Z : Finset V, G.mSepSet X Y Z → G.mSepSet X W (Z ∪ Y) →
-        G.mSepSet X (Y ∪ W) Z) :=
-  ⟨fun X Y Z     => mSepSet_symm G X Y Z,
-   fun X Y W Z h => mSepSet_decomp G X Y W Z h,
-   fun X Y W Z h => mSepSet_weak_union G X Y W Z h,
-   fun X Y W Z h1 h2 => mSepSet_contraction G X Y W Z h1 h2⟩
+/-- `dSepWalk` satisfies all four semi-graphoid axioms. -/
+theorem dSepWalk_semigraphoid (G : ADMG V) :
+    (∀ X Y Z : Finset V, G.dSepSetWalk X Y Z ↔ G.dSepSetWalk Y X Z) ∧
+    (∀ X Y W Z : Finset V, G.dSepSetWalk X (Y ∪ W) Z → G.dSepSetWalk X Y Z ∧ G.dSepSetWalk X W Z) ∧
+    (∀ X Y W Z : Finset V, G.dSepSetWalk X (Y ∪ W) Z →
+        G.dSepSetWalk X Y (Z ∪ W) ∧ G.dSepSetWalk X W (Z ∪ Y)) ∧
+    (∀ X Y W Z : Finset V, G.dSepSetWalk X Y Z → G.dSepSetWalk X W (Z ∪ Y) →
+        G.dSepSetWalk X (Y ∪ W) Z) :=
+  ⟨fun X Y Z     => dSepSetWalk_symm G X Y Z,
+   fun X Y W Z h => dSepSetWalk_decomp G X Y W Z h,
+   fun X Y W Z h => dSepSetWalk_weak_union G X Y W Z h,
+   fun X Y W Z h1 h2 => dSepSetWalk_contraction G X Y W Z h1 h2⟩
 
-/-- **Intersection**: X ⊥ Y | Z ∪ W ∧ X ⊥ W | Z ∪ Y → X ⊥ Y ∪ W | Z.
-
-    As for DAGs, the graphical m-separation relation satisfies Intersection
-    unconditionally — m-separation is a (compositional) graphoid.  An active
-    walk `x → (Y ∪ W)` given `Z` is re-routed by `intersection_walk` into an
-    active walk to `Y` given `Z ∪ W` or to `W` given `Z ∪ Y`, contradicting one
-    of the hypotheses; hence no such walk exists. -/
-theorem mSepSet_intersection (G : ADMG V) (X Y W Z : Finset V) :
-    G.mSepSet X Y (Z ∪ W) → G.mSepSet X W (Z ∪ Y) → G.mSepSet X (Y ∪ W) Z := by
-  intro h1 h2 x hx yw hyw π hwalk hhead hlast
+/-- **Intersection** for `dSepWalk`: X ⊥ Y | Z ∪ W ∧ X ⊥ W | Z ∪ Y → X ⊥ Y ∪ W | Z. -/
+theorem dSepSetWalk_intersection (G : ADMG V) (X Y W Z : Finset V) :
+    G.dSepSetWalk X Y (Z ∪ W) → G.dSepSetWalk X W (Z ∪ Y) → G.dSepSetWalk X (Y ∪ W) Z := by
+  intro h1 h2 x hx yw hyw πV πM hwalk hhead hlast
   by_contra hne
   rw [Bool.not_eq_true] at hne
-  rcases intersection_walk G Y W Z π yw hwalk hne hlast hyw with
-    ⟨πa, a, hwa, hheada, hlasta, haY, hblka⟩ | ⟨πb, b, hwb, hheadb, hlastb, hbW, hblkb⟩
-  · have hc : G.pathBlocked (Z ∪ W) πa = true :=
-      h1 x hx a haY πa hwa (by rw [hheada, hhead]) hlasta
+  rcases intersection_walk G Y W Z πV πM yw hwalk hne hlast hyw with
+    ⟨πaV, πaM, a, hwa, hheada, hlasta, haY, hblka⟩ | ⟨πbV, πbM, b, hwb, hheadb, hlastb, hbW, hblkb⟩
+  · have hc : G.pathBlocked (Z ∪ W) πaV πaM = true :=
+      h1 x hx a haY πaV πaM hwa (by rw [hheada, hhead]) hlasta
     rw [hblka] at hc; exact absurd hc (by simp)
-  · have hc : G.pathBlocked (Z ∪ Y) πb = true :=
-      h2 x hx b hbW πb hwb (by rw [hheadb, hhead]) hlastb
+  · have hc : G.pathBlocked (Z ∪ Y) πbV πbM = true :=
+      h2 x hx b hbW πbV πbM hwb (by rw [hheadb, hhead]) hlastb
     rw [hblkb] at hc; exact absurd hc (by simp)
-
--- ─────────────────────────────────────────────────────────────────────────────
--- §7. Basic lemmas
--- ─────────────────────────────────────────────────────────────────────────────
-
-/-- Bidirected edges are symmetric by construction -/
-lemma bid_symmetric (G : ADMG V) (u v : V) :
-    G.hasBidirected u v = G.hasBidirected v u := by
-  simp [hasBidirected, G.bid_symm u v]
-
-/-- No self-loops on directed edges -/
-lemma no_self_directed (G : ADMG V) (v : V) :
-    G.hasDirected v v = false :=
-  G.dir_no_loop v
-
-/-- No self-loops on bidirected edges -/
-lemma no_self_bidirected (G : ADMG V) (v : V) :
-    G.hasBidirected v v = false :=
-  G.bid_no_loop v
-
-/-- Bow-freeness, symmetrically: a directed edge u → v also excludes v ↔ u. -/
-lemma no_bow_symm (G : ADMG V) {u v : V} (h : G.directed u v = true) :
-    G.bidirected v u = false := by
-  rw [G.bid_symm v u]
-  exact G.no_bow u v h
-
-/-- Spouses are symmetric: v ∈ spouses u ↔ u ∈ spouses v -/
-lemma spouses_symm (G : ADMG V) (u v : V) :
-    u ∈ G.spouses v ↔ v ∈ G.spouses u := by
-  simp [spouses, G.bid_symm]
 
 end ADMG
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- §8. Correspondence with DAG.lean
+-- §10. Correspondence with DAG.lean
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Every definition above was ported from DAG.lean, not MAG.lean.  This section
--- certifies that formally: a DAG, viewed as an ADMG with no bidirected edges,
--- has the SAME colliders, the SAME blocked segments/paths, and the SAME
--- separation relation as DAG.lean defines directly.  (MAG.lean's variants —
--- its ancestor-based collider opening and its walk-free `mSep` — would fail
--- these correspondence lemmas.)
+-- A DAG, viewed as an ADMG with no bidirected edges, has NO bows, so its
+-- walks admit a UNIQUE mark assignment (`toADMGMarks`), and under that
+-- assignment `dSepWalk` on the embedding is exactly DAG.lean's own
+-- (walk-quantified) `dSep`.
 
 namespace DAG
 
-/-- View a DAG as an ADMG with no bidirected edges.  Bow-freeness holds
-    vacuously. -/
+/-- View a DAG as an ADMG with no bidirected edges. -/
 def toADMG (D : DAG V) : ADMG V where
   directed    := D.graph.adj
   bidirected  := fun _ _ => false
   dir_no_loop := D.graph.no_self_loop
   bid_no_loop := fun _ => rfl
   bid_symm    := fun _ _ => rfl
-  no_bow      := fun _ _ _ => rfl
   dir_acyclic := D.acyclic
 
-/-- Adjacency agrees. -/
-lemma toADMG_adj (D : DAG V) (a b : V) : D.toADMG.Adj a b ↔ D.Adj a b := by
-  simp [ADMG.Adj, DAG.Adj, toADMG, DAG.hasEdge, DirectedGraph.hasEdge]
+/-- The canonical mark for a DAG edge: forward if the edge points that way,
+    backward otherwise.  Since `toADMG` has no bidirected edges and
+    acyclicity forbids both `hasEdge a b` and `hasEdge b a`, this is the
+    ONLY mark that validates an actual DAG edge between `a` and `b`. -/
+def toADMGMark (D : DAG V) (a b : V) : Mark :=
+  if D.hasEdge a b then Mark.dirFwd else Mark.dirBack
 
-/-- Walks agree. -/
-lemma toADMG_isWalk (D : DAG V) (l : List V) : D.toADMG.IsWalk l ↔ D.IsWalk l :=
-  ⟨fun h => h.imp fun a b => (toADMG_adj D a b).mp,
-   fun h => h.imp fun a b => (toADMG_adj D a b).mpr⟩
+/-- The canonical marks for a DAG walk. -/
+def toADMGMarks (D : DAG V) : List V → List Mark
+  | [] => []
+  | [_] => []
+  | a :: b :: l => D.toADMGMark a b :: D.toADMGMarks (b :: l)
 
-/-- Colliders agree: with no bidirected edges, the arrowhead-based mixed-graph
-    collider is exactly the DAG collider. -/
-lemma toADMG_isCollider (D : DAG V) (p c n : V) :
-    D.toADMG.isCollider p c n = D.isCollider p c n := by
-  simp [ADMG.isCollider, DAG.isCollider, toADMG, DAG.hasEdge, DirectedGraph.hasEdge]
+lemma toADMGMark_valid (D : DAG V) {a b : V} (h : D.Adj a b) :
+    Mark.valid D.toADMG a b (D.toADMGMark a b) = true := by
+  unfold toADMGMark Mark.valid
+  rcases h with h | h
+  · rw [if_pos h]; exact h
+  · by_cases hab : D.hasEdge a b
+    · rw [if_pos hab]; exact hab
+    · rw [if_neg hab]; exact h
 
-/-- Descendants agree (both are directed-edge reachability). -/
+lemma toADMG_isWalk (D : DAG V) : ∀ l : List V, D.IsWalk l →
+    D.toADMG.IsWalk l (D.toADMGMarks l)
+  | [], _ => trivial
+  | [_], _ => trivial
+  | a :: b :: l, h => by
+      rw [DAG.isWalk_cons₂] at h
+      exact ⟨toADMGMark_valid D h.1, toADMG_isWalk D (b :: l) h.2⟩
+
+/-- On a bow-free graph (like `toADMG`), the marks of a walk over given
+    vertices are forced — there is only one valid choice at each step. -/
+lemma toADMG_marks_unique (D : DAG V) :
+    ∀ (verts : List V) (marks : List Mark), D.toADMG.IsWalk verts marks →
+      marks = D.toADMGMarks verts := by
+  intro verts
+  induction verts with
+  | nil => intro marks h; cases marks with
+      | nil => rfl
+      | cons m ms => exact absurd h (by simp [ADMG.IsWalk])
+  | cons a vs ih =>
+    intro marks h
+    cases vs with
+    | nil => cases marks with
+        | nil => rfl
+        | cons m ms => exact absurd h (by simp [ADMG.IsWalk])
+    | cons b vs' =>
+      cases marks with
+      | nil => exact absurd h (by simp [ADMG.IsWalk])
+      | cons m ms =>
+        obtain ⟨hvalid, htail⟩ := h
+        have hm : m = D.toADMGMark a b := by
+          unfold toADMGMark
+          cases m with
+          | dirFwd =>
+            have hab : D.hasEdge a b := hvalid
+            rw [if_pos hab]
+          | dirBack =>
+            have hba : D.hasEdge b a := hvalid
+            have hab : ¬ D.hasEdge a b := fun h => by
+              have := D.no_2cycle h; rw [this] at hba; exact absurd hba (by simp)
+            rw [if_neg hab]
+          | bidir => simp [Mark.valid, toADMG] at hvalid
+        show m :: ms = D.toADMGMark a b :: D.toADMGMarks (b :: vs')
+        rw [hm, ih ms htail]
+
+private lemma toADMGMark_intoRight (D : DAG V) (a b : V) :
+    (D.toADMGMark a b).intoRight = D.hasEdge a b := by
+  unfold toADMGMark
+  by_cases h : D.hasEdge a b
+  · rw [if_pos h, h]; rfl
+  · rw [if_neg h]
+    have hf : D.hasEdge a b = false := by simpa using h
+    rw [hf]; rfl
+
+-- Needs `Adj b c`: without SOME edge between b,c, `toADMGMark` defaults to
+-- `dirBack`, which would not match `hasEdge c b = false` in the vacuous case.
+private lemma toADMGMark_intoLeft (D : DAG V) {b c : V} (hbc : D.Adj b c) :
+    (D.toADMGMark b c).intoLeft = D.hasEdge c b := by
+  unfold toADMGMark
+  by_cases h : D.hasEdge b c
+  · rw [if_pos h, D.no_2cycle h]; rfl
+  · rw [if_neg h]
+    have hcb : D.hasEdge c b = true := by
+      rcases hbc with h' | h'
+      · exact absurd h' h
+      · exact h'
+    rw [hcb]; rfl
+
+lemma toADMG_isCollider (D : DAG V) {a b c : V} (hbc : D.Adj b c) :
+    CausalLib.isCollider (D.toADMGMark a b) (D.toADMGMark b c) = D.isCollider a b c := by
+  unfold CausalLib.isCollider DAG.isCollider
+  rw [toADMGMark_intoRight, toADMGMark_intoLeft D hbc]
+
 lemma toADMG_descendants (D : DAG V) (v : V) :
     D.toADMG.descendants v = D.descendants v := rfl
 
-/-- Blocked segments agree: in particular the collider-opening condition is the
-    DAG one (self or DESCENDANT in Z), not an ancestor-based variant. -/
-lemma toADMG_segmentBlocked (D : DAG V) (Z : Finset V) (p c n : V) :
-    D.toADMG.segmentBlocked Z p c n = D.segmentBlocked Z p c n := by
-  simp only [ADMG.segmentBlocked, DAG.segmentBlocked, toADMG_isCollider,
-    toADMG_descendants]
+lemma toADMG_segmentBlocked (D : DAG V) (Z : Finset V) {a b c : V} (hbc : D.Adj b c) :
+    D.toADMG.segmentBlocked Z b (D.toADMGMark a b) (D.toADMGMark b c) = D.segmentBlocked Z a b c := by
+  simp only [ADMG.segmentBlocked, DAG.segmentBlocked, toADMG_isCollider D hbc, toADMG_descendants]
   rfl
 
-/-- Blocked paths agree. -/
 lemma toADMG_pathBlocked (D : DAG V) (Z : Finset V) :
-    ∀ l : List V, D.toADMG.pathBlocked Z l = D.pathBlocked Z l
-  | [] => rfl
-  | [_] => rfl
-  | [_, _] => rfl
-  | a :: b :: c :: rest => by
-      show (D.toADMG.segmentBlocked Z a b c || D.toADMG.pathBlocked Z (b :: c :: rest))
+    ∀ l : List V, D.IsWalk l → D.toADMG.pathBlocked Z l (D.toADMGMarks l) = D.pathBlocked Z l
+  | [], _ => rfl
+  | [_], _ => rfl
+  | [_, _], _ => rfl
+  | a :: b :: c :: rest, hw => by
+      rw [DAG.isWalk_cons₂] at hw
+      obtain ⟨_, hw2⟩ := hw
+      have hw2' := hw2
+      rw [DAG.isWalk_cons₂] at hw2'
+      obtain ⟨hbc, _⟩ := hw2'
+      show (D.toADMG.segmentBlocked Z b (D.toADMGMark a b) (D.toADMGMark b c) ||
+          D.toADMG.pathBlocked Z (b :: c :: rest) (D.toADMGMarks (b :: c :: rest)))
         = (D.segmentBlocked Z a b c || D.pathBlocked Z (b :: c :: rest))
-      rw [toADMG_segmentBlocked, toADMG_pathBlocked D Z (b :: c :: rest)]
+      rw [toADMG_segmentBlocked D Z hbc, toADMG_pathBlocked D Z (b :: c :: rest) hw2]
 
-/-- **m-Separation on a bidirected-edge-free ADMG is exactly d-separation.**
-    The ADMG development is a conservative extension of DAG.lean. -/
-theorem toADMG_mSep_iff (D : DAG V) (X Y : V) (Z : Finset V) :
-    D.toADMG.mSep X Y Z ↔ D.dSep X Y Z := by
+/-- Recover an ordinary DAG walk from an ADMG walk over the (bidirected-edge-
+    free) embedding: every mark must be `dirFwd` or `dirBack`, both of which
+    give a genuine DAG edge. -/
+lemma toADMG_isWalk_recover (D : DAG V) :
+    ∀ (verts : List V) (marks : List Mark), D.toADMG.IsWalk verts marks → D.IsWalk verts := by
+  intro verts
+  induction verts with
+  | nil => intro _ _; exact D.isWalk_nil
+  | cons a vs ih =>
+    intro marks h
+    cases vs with
+    | nil => exact D.isWalk_singleton a
+    | cons b vs' =>
+      cases marks with
+      | nil => exact absurd h (by simp [ADMG.IsWalk])
+      | cons m ms =>
+        obtain ⟨hvalid, htail⟩ := h
+        rw [DAG.isWalk_cons₂]
+        refine ⟨?_, ih ms htail⟩
+        unfold Mark.valid at hvalid
+        cases m with
+        | dirFwd => exact Or.inl hvalid
+        | dirBack => exact Or.inr hvalid
+        | bidir => simp [toADMG] at hvalid
+
+/-- **`dSepWalk` on a bidirected-edge-free ADMG is exactly DAG.lean's own
+    (walk-quantified) `dSep`.**  Bow-freeness is automatic here (no
+    bidirected edges at all), which is why the correspondence is with
+    `dSepWalk` — the walk-quantified relation — and not with the
+    simple-path-quantified `dSep` (for which no such general correspondence
+    with DAG.lean's walk-based `dSep` is claimed). -/
+theorem toADMG_dSepWalk_iff (D : DAG V) (X Y : V) (Z : Finset V) :
+    D.toADMG.dSepWalk X Y Z ↔ D.dSep X Y Z := by
   constructor
   · intro h path hwalk hhead hlast
-    rw [← toADMG_pathBlocked]
-    exact h path ((toADMG_isWalk D path).mpr hwalk) hhead hlast
-  · intro h path hwalk hhead hlast
-    rw [toADMG_pathBlocked]
-    exact h path ((toADMG_isWalk D path).mp hwalk) hhead hlast
-
-/-- Set-level correspondence. -/
-theorem toADMG_mSepSet_iff (D : DAG V) (X Y Z : Finset V) :
-    D.toADMG.mSepSet X Y Z ↔ D.dSepSet X Y Z := by
-  unfold ADMG.mSepSet DAG.dSepSet
-  exact forall₄_congr fun x _ y _ => toADMG_mSep_iff D x y Z
+    rw [← toADMG_pathBlocked D Z path hwalk]
+    exact h path (D.toADMGMarks path) (toADMG_isWalk D path hwalk) hhead hlast
+  · intro h verts marks hwalk hhead hlast
+    have hdwalk : D.IsWalk verts := toADMG_isWalk_recover D verts marks hwalk
+    rw [toADMG_marks_unique D verts marks hwalk, toADMG_pathBlocked D Z verts hdwalk]
+    exact h verts hdwalk hhead hlast
 
 end DAG
 end CausalLib
