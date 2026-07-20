@@ -10,7 +10,8 @@ Three graph structures, building from general to specific:
 |---|---|---|
 | `CausalLib/DirectedGraph.lean` | `DirectedGraph` | Asymmetric neighborhoods, cycles allowed |
 | `CausalLib/DAG.lean` | `DAG` | Directed acyclic graph; d-separation is a graphoid (fully proved) |
-| `CausalLib/ADMG.lean` | `ADMG` | General acyclic directed mixed graph (bows allowed); separation graphoid axioms fully proved at the walk level |
+| `CausalLib/ADMG.lean` | `ADMG` | General acyclic directed mixed graph (bows allowed); mark-annotated walks, separation, graphoid axioms at the walk level |
+| `CausalLib/WalkToPath.lean` | — | Walk-to-path excision; all five graphoid axioms on the textbook path-based `dSep` |
 
 ## Structure
 
@@ -21,7 +22,8 @@ causallib/
 ├── CausalLib/
 │   ├── DirectedGraph.lean   -- General directed graph
 │   ├── DAG.lean             -- DAG + d-separation + graphoid axioms
-│   └── ADMG.lean            -- ADMG + d-separation + graphoid axioms + DAG embedding
+│   ├── ADMG.lean            -- ADMG + d-separation + graphoid axioms + DAG embedding
+│   └── WalkToPath.lean      -- walk→path excision; graphoid axioms on path-based dSep
 ├── weak_union_dsep.tex      -- Paper proof of Weak Union via the Active Path Lemma
 └── README.md
 ```
@@ -73,26 +75,37 @@ and a bidirected edge (a "bow").
   a path additionally requires `vertices.Nodup` (no repeated vertex — the
   literal, textbook meaning of "path").
 - `dSep` / `dSepSet` — **d-separation quantified over genuine simple paths**,
-  matching the textbook definition exactly. **Symmetry and Decomposition are
-  proved directly for this relation**, with no sorry.
+  matching the textbook definition exactly.
 - `dSepWalk` / `dSepSetWalk` — an auxiliary, **walk**-quantified relation
-  (repeats allowed; the same style DAG.lean itself uses). **Weak Union,
-  Contraction and Intersection are proved for this relation**, via
-  `chainBuild`, `active_path_lemma`, `contraction_walk`, `intersection_walk`
-  — all with no sorry, and none of it needs bow-freeness (see `Mark` above).
-  `dSep_of_dSepWalk` transfers walk-level separation down to path-level
-  separation for free.
-  **Why the deep axioms stop at `dSepWalk`, not `dSep`:** upgrading them to
-  the simple-path relation needs a genuine "every active walk contains an
-  active simple path" shortcutting theorem. It's true and provable in
-  principle, but the gluing construction inside the Active Path Lemma can
-  revisit an earlier path vertex when a bidirected edge lets a directed
-  chain double back to it, and repairing that needs a forbidden-set-avoiding
-  reachability search — real additional work, not included here. This gap
-  is documented in code on `dSepWalk`.
+  (repeats allowed; the same style DAG.lean itself uses). Weak Union,
+  Contraction and Intersection are proved here first, via `chainBuild`,
+  `active_path_lemma`, `contraction_walk`, `intersection_walk` — none of it
+  needing bow-freeness (see `Mark` above).
 - `DAG.toADMG` — embeds any DAG as a bidirected-edge-free ADMG
 - `DAG.toADMG_dSepWalk_iff` — `dSepWalk` on the embedding is exactly
   DAG.lean's own (walk-quantified) `dSep`
+
+### WalkToPath
+Closes the walk-to-path gap, landing **all five graphoid axioms on the
+textbook path-based `dSep`** — no sorry, no new axioms.
+
+- `DirectedGraph.reachableN_subset_card` — the depth bound `Fintype.card V`
+  in `reachable` is *saturating* (pigeonhole on the nondecreasing frontier),
+  which yields `ADMG.descendants_trans`, transitivity of `descendants`
+- `excise_preserves_active` — a walk repeating a vertex can be cut down to a
+  strictly shorter **active** walk with the same endpoints
+- `seam_unblocked` — the crux. Excising the loop `v :: B ++ [v]` merges the
+  two triples at `v` into one new "seam" triple. If the seam is a collider
+  that neither original triple already opens, the loop must leave `v`
+  forward and re-enter `v` forward, forcing a collider strictly inside the
+  loop; that collider is a descendant of `v` and is open, so `v ∈ An(Z)` and
+  the seam is open too. This is exactly where the *graph-level* descendant
+  test in `segmentBlocked` (rather than a walk-reaching one) is load-bearing.
+- `active_walk_contains_active_path` — minimal-witness argument: a
+  minimum-length active walk cannot repeat a vertex
+- `dSep_iff_dSepWalk` / `dSepSet_iff_dSepSetWalk` — the equivalence
+- `dSepSet_weak_union_path`, `dSepSet_contraction_path`,
+  `dSepSet_intersection_path`, and the capstone `dSep_full_graphoid`
 
 ## Roadmap
 
@@ -104,7 +117,7 @@ and a bidirected edge (a "bow").
       Decomposition directly for it
 - [x] Prove Weak Union, Contraction, Intersection for the walk-quantified
       `dSepWalk`; embed DAGs and prove the walk-level relations agree
-- [ ] Prove the walk-to-simple-path shortcutting theorem needed to lift
-      Weak Union / Contraction / Intersection from `dSepWalk` to `dSep`
+- [x] Prove the walk-to-simple-path shortcutting theorem and lift all five
+      graphoid axioms from `dSepWalk` onto the textbook `dSep`
 - [ ] Connect to `Mathlib.Combinatorics.SimpleGraph`
 - [ ] Define probability measures and prove the backdoor adjustment theorem

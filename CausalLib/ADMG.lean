@@ -8,11 +8,12 @@
 --
 -- `dSep` is the literal textbook definition: quantified over genuine SIMPLE
 -- PATHS (no repeated vertex).  Symmetry and Decomposition are proved
--- directly for it.  Weak Union, Contraction and Intersection are proved for
--- the auxiliary, walk-quantified relation `dSepWalk` (repeats allowed, the
--- same style DAG.lean itself uses for its `dSep`) — see the doc comment on
--- `dSepWalk` for exactly why, and `dSep_of_dSepWalk` for the direction that
--- transfers for free.
+-- directly for it.  Weak Union, Contraction and Intersection are proved
+-- here for the auxiliary, walk-quantified relation `dSepWalk` (repeats
+-- allowed, the same style DAG.lean itself uses for its `dSep`).
+--
+-- `CausalLib/WalkToPath.lean` closes the gap: it proves `dSep ↔ dSepWalk`
+-- and lands all five graphoid axioms on `dSep` itself.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 import Mathlib.Data.Finset.Basic
@@ -534,15 +535,13 @@ def dSep (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
     DAG.lean's own `dSep` is exactly this walk-quantified notion.
 
     Weak Union, Contraction and Intersection below are proved for
-    `dSepWalk`, not `dSep` directly.  The missing step to transfer them to
-    `dSep` is a genuine "every active walk contains an active simple path"
-    shortcutting theorem: real and provable in principle (e.g. via a
-    minimal-active-witness argument), but NOT included here — the gluing
-    construction inside the Active Path Lemma can revisit an earlier vertex
-    of the path when a bidirected edge lets a directed chain double back,
-    and repairing that needs a forbidden-set-avoiding search argument beyond
-    the scope of this file.  `dSep_of_dSepWalk` is the direction that DOES
-    transfer for free. -/
+    `dSepWalk`, not `dSep` directly.  `dSep_of_dSepWalk` is the direction
+    that transfers for free.
+
+    The converse — "every active walk contains an active simple path", and
+    hence `dSep ↔ dSepWalk` — is proved in `CausalLib/WalkToPath.lean` by a
+    minimal-witness/excision argument, which also transfers all five
+    graphoid axioms onto `dSep` (`ADMG.dSep_full_graphoid`). -/
 def dSepWalk (G : ADMG V) (X Y : V) (Z : Finset V) : Prop :=
   ∀ (verts : List V) (marks : List Mark),
     G.IsWalk verts marks →
