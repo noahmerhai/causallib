@@ -12,3 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: leanprover/lean-action@v1
+      - name: Check simple-path graphoid proofs
+        run: lake env lean CausalLibTest/DAG.lean
+      - name: Check ADMG marked-path graphoid proofs
+        run: lake env lean CausalLibTest/ADMG.lean
